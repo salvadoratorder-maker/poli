@@ -1,0 +1,13 @@
+{
+  "name": "polypaper-bot",
+  "version": "1.0.0",
+  "description": "Paper trading bot para Polymarket",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node --watch bot.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
