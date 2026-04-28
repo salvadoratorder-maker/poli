@@ -16,13 +16,19 @@ const CONFIG = {
   TAKE_PROFIT_PARTIAL: 0.20,
   TRAILING_STOP: 0.05,
 
-  MIN_SCORE: 6
+  MIN_SCORE: 8
 };
 
 // ================= STATE =================
 let capital = CONFIG.INITIAL_CAPITAL;
 let openTrades = [];
 let priceHistory = {};
+
+let lastTradeTime = 0;
+const COOLDOWN = 30000;
+
+let lossStreak = 0;
+const MAX_LOSSES = 2;
 
 // ================= MOCK DATA =================
 function getMarkets() {
@@ -89,24 +95,19 @@ function hasConsensus(traders, marketId) {
 function calculateScore(market, traders) {
   let score = 0;
 
-  // volumen
   if (market.volume24h >= CONFIG.MIN_VOLUME) score += 2;
 
-  // precio
   if (
     market.price >= CONFIG.PRICE_MIN &&
     market.price <= CONFIG.PRICE_MAX
   ) score += 1;
 
-  // consenso
   const whales = hasConsensus(traders, market.id);
   if (whales >= CONFIG.MIN_WHALES) score += 2;
 
-  // tendencia
   const trend = getTrend(market.id);
   if (trend > 0.02) score += 3;
 
-  // momentum
   const momentum = getMomentum(market.id);
   if (momentum > 0.01) score += 3;
 
@@ -141,7 +142,15 @@ function closeTrade(trade, price) {
   const value = trade.size * (price / trade.entry);
   capital += value;
 
-  console.log("🔴 CLOSE:", trade.marketId, "capital:", capital.toFixed(2));
+  const pnl = (price - trade.entry) / trade.entry;
+
+  if (pnl < 0) {
+    lossStreak++;
+  } else {
+    lossStreak = 0;
+  }
+
+  console.log("🔴 CLOSE:", trade.marketId, "capital:", capital.toFixed(2), "lossStreak:", lossStreak);
 
   openTrades = openTrades.filter(t => t !== trade);
 }
@@ -188,6 +197,7 @@ function manageTrade(trade, currentPrice) {
 function runBot() {
   const markets = getMarkets();
   const traders = getTraders();
+  const now = Date.now();
 
   for (const market of markets) {
     updatePriceHistory(market);
@@ -197,10 +207,13 @@ function runBot() {
     if (
       score >= CONFIG.MIN_SCORE &&
       openTrades.length < CONFIG.MAX_OPEN_TRADES &&
-      !openTrades.find(t => t.marketId === market.id)
+      !openTrades.find(t => t.marketId === market.id) &&
+      now - lastTradeTime > COOLDOWN &&
+      lossStreak < MAX_LOSSES
     ) {
       console.log("✅ SCORE OK:", market.id, "score:", score);
       openTrade(market);
+      lastTradeTime = now;
     }
   }
 
