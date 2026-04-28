@@ -1,227 +1,217 @@
-const axios = require('axios');
-const fs = require('fs');
-
-// ============================================
-// CONFIGURACIÓN - CAMBIA ESTOS NÚMEROS SI QUIERES
-// ============================================
+// ================= CONFIG PRO =================
 const CONFIG = {
-    CAPITAL_INICIAL: 500,        
-    APUESTA_POR_TRADE: 15,       
-    STOP_LOSS: 0.12,             
-    MIN_VOLUMEN: 500000,         
-    MAX_TRADES_ABIERTOS: 3,      
-    CICLO_MINUTOS: 60,           
+  INITIAL_CAPITAL: 200,
+
+  RISK_PER_TRADE: 0.03,
+  MAX_OPEN_TRADES: 2,
+
+  MIN_VOLUME: 500000,
+  PRICE_MIN: 0.35,
+  PRICE_MAX: 0.85,
+
+  MIN_WHALES: 6,
+  TOP_TRADERS: 20,
+
+  STOP_LOSS: 0.12,
+  TAKE_PROFIT_PARTIAL: 0.20,
+  TRAILING_STOP: 0.05,
+
+  MIN_SCORE: 6
 };
 
-let capital = CONFIG.CAPITAL_INICIAL;
-let tradesAbiertos = [];
-let tradesCerrados = [];
-let historial = [];
+// ================= STATE =================
+let capital = CONFIG.INITIAL_CAPITAL;
+let openTrades = [];
+let priceHistory = {};
 
-// ============================================
-// OBTENER DATOS REALES DE POLYMARKET
-// ============================================
-async function obtenerMercados() {
-    try {
-        const response = await axios.get('https://gamma-api.polymarket.com/markets', {
-            params: { limit: 50, closed: false, order: 'volume24hr' }
-        });
-        console.log(`✅ Cargados ${response.data.length} mercados reales`);
-        return response.data;
-    } catch (error) {
-        console.log("❌ Error al obtener mercados:", error.message);
-        return [];
-    }
+// ================= MOCK DATA =================
+function getMarkets() {
+  return [
+    { id: 1, price: Math.random() * 0.2 + 0.4, volume24h: 800000 },
+    { id: 2, price: Math.random() * 0.2 + 0.4, volume24h: 200000 },
+  ];
 }
 
-// ============================================
-// BUSCAR SEÑAL DE TRADING
-// ============================================
-function buscarSeñal(mercados) {
-    for (const m of mercados) {
-        const precio = parseFloat(m.price) || 0.5;
-        const volumen = parseFloat(m.volume24hr) || 0;
-        const liquidez = parseFloat(m.liquidity) || 0;
-        
-        if (precio > 0.30 && precio < 0.70 && volumen >= CONFIG.MIN_VOLUMEN && liquidez > 10000) {
-            return {
-                id: m.id,
-                pregunta: m.question || m.title || "Mercado",
-                precio: precio,
-                volumen: volumen,
-                apostarYES: precio < 0.5
-            };
-        }
-    }
-    return null;
+function getTraders() {
+  return Array.from({ length: 20 }).map((_, i) => ({
+    id: i,
+    positions: [1]
+  }));
 }
 
-// ============================================
-// SIMULAR APERTURA DE TRADE
-// ============================================
-function abrirTrade(señal) {
-    if (tradesAbiertos.length >= CONFIG.MAX_TRADES_ABIERTOS) {
-        console.log(`⚠️ Máximo de trades abiertos: ${CONFIG.MAX_TRADES_ABIERTOS}`);
-        return;
-    }
-    
-    if (capital < CONFIG.APUESTA_POR_TRADE) {
-        console.log(`⚠️ Capital insuficiente: $${capital.toFixed(2)}`);
-        return;
-    }
-    
-    const trade = {
-        id: Date.now(),
-        pregunta: señal.pregunta,
-        entrada: señal.precio,
-        direccion: señal.apostarYES ? "YES" : "NO",
-        cantidad: CONFIG.APUESTA_POR_TRADE,
-        stopLoss: señal.apostarYES ? señal.precio * 0.88 : señal.precio * 1.12,
-        fecha: new Date().toISOString()
-    };
-    
-    capital -= trade.cantidad;
-    tradesAbiertos.push(trade);
-    
-    historial.push({
-        tipo: "APERTURA",
-        fecha: trade.fecha,
-        pregunta: trade.pregunta.substring(0, 50),
-        direccion: trade.direccion,
-        entrada: trade.entrada,
-        cantidad: trade.cantidad,
-        capital: capital
-    });
-    
-    console.log(`📥 APUESTA: ${trade.pregunta.substring(0, 45)}`);
-    console.log(`   ${trade.direccion} @ $${trade.entrada.toFixed(3)} | $${trade.cantidad}`);
+// ================= HELPERS =================
+function updatePriceHistory(market) {
+  if (!priceHistory[market.id]) {
+    priceHistory[market.id] = [];
+  }
+
+  priceHistory[market.id].push(market.price);
+
+  if (priceHistory[market.id].length > 10) {
+    priceHistory[market.id].shift();
+  }
 }
 
-// ============================================
-// SIMULAR CIERRE DE TRADES
-// ============================================
-async function actualizarTrades(mercados) {
-    for (let i = 0; i < tradesAbiertos.length; i++) {
-        const t = tradesAbiertos[i];
-        
-        const mercadoActual = mercados.find(m => 
-            (m.question && m.question.includes(t.pregunta.substring(0, 30))) ||
-            (m.title && m.title.includes(t.pregunta.substring(0, 30)))
-        );
-        
-        let precioActual = t.entrada;
-        if (mercadoActual) precioActual = parseFloat(mercadoActual.price) || t.entrada;
-        else precioActual = t.entrada * (0.97 + Math.random() * 0.06);
-        
-        let pnl = 0;
-        let cerrado = false;
-        let razon = "";
-        
-        if (t.direccion === "YES") {
-            pnl = t.cantidad * ((precioActual - t.entrada) / t.entrada);
-            if (precioActual <= t.stopLoss) { cerrado = true; razon = "STOP_LOSS"; pnl = -t.cantidad * 0.12; }
-            else if (precioActual >= t.entrada * 1.20) { cerrado = true; razon = "TAKE_PROFIT"; pnl = t.cantidad * 0.20; }
-        } else {
-            pnl = t.cantidad * ((t.entrada - precioActual) / t.entrada);
-            if (precioActual >= t.stopLoss) { cerrado = true; razon = "STOP_LOSS"; pnl = -t.cantidad * 0.12; }
-            else if (precioActual <= t.entrada * 0.80) { cerrado = true; razon = "TAKE_PROFIT"; pnl = t.cantidad * 0.20; }
-        }
-        
-        if (cerrado) {
-            capital += t.cantidad + pnl;
-            tradesCerrados.push({ ...t, pnl, razon, salida: precioActual, fechaCierre: new Date().toISOString() });
-            tradesAbiertos.splice(i, 1);
-            i--;
-            
-            historial.push({
-                tipo: "CIERRE",
-                fecha: new Date().toISOString(),
-                pregunta: t.pregunta.substring(0, 50),
-                razon: razon,
-                pnl: pnl,
-                capital: capital
-            });
-            
-            console.log(`🛑 ${razon}: ${t.pregunta.substring(0, 35)} | ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`);
-        }
+function getTrend(marketId) {
+  const history = priceHistory[marketId];
+  if (!history || history.length < 5) return 0;
+
+  const start = history[0];
+  const end = history[history.length - 1];
+
+  return (end - start) / start;
+}
+
+function getMomentum(marketId) {
+  const history = priceHistory[marketId];
+  if (!history || history.length < 3) return 0;
+
+  const prev = history[history.length - 3];
+  const current = history[history.length - 1];
+
+  return (current - prev) / prev;
+}
+
+function hasConsensus(traders, marketId) {
+  const top = traders.slice(0, CONFIG.TOP_TRADERS);
+  let count = 0;
+
+  for (const trader of top) {
+    if (trader.positions.includes(marketId)) {
+      count++;
     }
+  }
+
+  return count;
 }
 
-// ============================================
-// GUARDAR RESULTADOS EN CSV
-// ============================================
-function guardarCSV() {
-    const ganados = tradesCerrados.filter(t => t.pnl > 0).length;
-    const perdidos = tradesCerrados.filter(t => t.pnl <= 0).length;
-    const pnlTotal = tradesCerrados.reduce((s, t) => s + t.pnl, 0);
-    const roi = ((pnlTotal) / CONFIG.CAPITAL_INICIAL) * 100;
-    
-    let csv = "Fecha,Tipo,Pregunta,Dirección,Entrada,Salida,Cantidad,PnL,Capital,Razón\n";
-    
-    for (const e of historial) {
-        if (e.tipo === "APERTURA") {
-            csv += `${e.fecha},APERTURA,"${e.pregunta}",${e.direccion},${e.entrada.toFixed(3)},-,${e.cantidad},-,${e.capital},-\n`;
-        } else {
-            const trade = tradesCerrados.find(t => t.fecha === e.fecha);
-            csv += `${e.fecha},CIERRE,"${e.pregunta}",${trade?.direccion || "-"},${trade?.entrada.toFixed(3) || "-"},${trade?.salida.toFixed(3) || "-"},${trade?.cantidad || "-"},${e.pnl >= 0 ? '+' : ''}${e.pnl.toFixed(2)},${e.capital},${e.razon}\n`;
-        }
+// ================= SCORE =================
+function calculateScore(market, traders) {
+  let score = 0;
+
+  // volumen
+  if (market.volume24h >= CONFIG.MIN_VOLUME) score += 2;
+
+  // precio
+  if (
+    market.price >= CONFIG.PRICE_MIN &&
+    market.price <= CONFIG.PRICE_MAX
+  ) score += 1;
+
+  // consenso
+  const whales = hasConsensus(traders, market.id);
+  if (whales >= CONFIG.MIN_WHALES) score += 2;
+
+  // tendencia
+  const trend = getTrend(market.id);
+  if (trend > 0.02) score += 3;
+
+  // momentum
+  const momentum = getMomentum(market.id);
+  if (momentum > 0.01) score += 3;
+
+  return score;
+}
+
+// ================= TRADING =================
+function getPositionSize() {
+  return capital * CONFIG.RISK_PER_TRADE;
+}
+
+function openTrade(market) {
+  const size = getPositionSize();
+
+  if (capital < size) return;
+
+  capital -= size;
+
+  openTrades.push({
+    marketId: market.id,
+    entry: market.price,
+    size,
+    partialClosed: false,
+    trailingActive: false,
+    peak: market.price
+  });
+
+  console.log("🟢 OPEN:", market.id, "size:", size.toFixed(2));
+}
+
+function closeTrade(trade, price) {
+  const value = trade.size * (price / trade.entry);
+  capital += value;
+
+  console.log("🔴 CLOSE:", trade.marketId, "capital:", capital.toFixed(2));
+
+  openTrades = openTrades.filter(t => t !== trade);
+}
+
+function closePartial(trade, price) {
+  const half = trade.size * 0.5;
+  const value = half * (price / trade.entry);
+
+  capital += value;
+  trade.size -= half;
+
+  console.log("🟡 PARTIAL:", trade.marketId);
+}
+
+function manageTrade(trade, currentPrice) {
+  const pnl = (currentPrice - trade.entry) / trade.entry;
+
+  if (pnl <= -CONFIG.STOP_LOSS) {
+    closeTrade(trade, currentPrice);
+    return;
+  }
+
+  if (pnl >= CONFIG.TAKE_PROFIT_PARTIAL && !trade.partialClosed) {
+    closePartial(trade, currentPrice);
+    trade.partialClosed = true;
+    trade.trailingActive = true;
+    trade.peak = currentPrice;
+  }
+
+  if (trade.trailingActive) {
+    if (currentPrice > trade.peak) {
+      trade.peak = currentPrice;
     }
-    
-    csv += `\n--- RESUMEN ---\n`;
-    csv += `Capital Inicial,${CONFIG.CAPITAL_INICIAL}\n`;
-    csv += `Capital Final,${(CONFIG.CAPITAL_INICIAL + pnlTotal).toFixed(2)}\n`;
-    csv += `PnL Total,${pnlTotal.toFixed(2)}\n`;
-    csv += `ROI,${roi.toFixed(1)}%\n`;
-    csv += `Trades Totales,${tradesCerrados.length}\n`;
-    csv += `Ganados,${ganados}\n`;
-    csv += `Perdidos,${perdidos}\n`;
-    csv += `Win Rate,${tradesCerrados.length > 0 ? (ganados/tradesCerrados.length*100).toFixed(1) : 0}%\n`;
-    
-    fs.writeFileSync('simulacion.csv', csv);
-    console.log(`📁 Resultados guardados en simulacion.csv`);
-}
 
-// ============================================
-// CICLO PRINCIPAL
-// ============================================
-async function ciclo() {
-    console.log(`\n${"=".repeat(45)}`);
-    console.log(`🔄 CICLO - ${new Date().toLocaleString()}`);
-    console.log(`💰 Capital: $${capital.toFixed(2)}`);
-    
-    const mercados = await obtenerMercados();
-    if (mercados.length === 0) return;
-    
-    const señal = buscarSeñal(mercados);
-    if (señal) {
-        console.log(`📡 SEÑAL: ${señal.pregunta.substring(0, 45)}`);
-        console.log(`   Precio: $${señal.precio.toFixed(3)} | Vol: $${(señal.volumen/1e6).toFixed(1)}M`);
-        abrirTrade(señal);
-    } else {
-        console.log(`ℹ️ Sin señal en este ciclo`);
+    const drop = (trade.peak - currentPrice) / trade.peak;
+
+    if (drop >= CONFIG.TRAILING_STOP) {
+      closeTrade(trade, currentPrice);
     }
-    
-    await actualizarTrades(mercados);
-    
-    const pnlTotal = tradesCerrados.reduce((s, t) => s + t.pnl, 0);
-    console.log(`📊 PnL Total: $${pnlTotal.toFixed(2)} | ROI: ${((pnlTotal/CONFIG.CAPITAL_INICIAL)*100).toFixed(1)}%`);
-    console.log(`   Abiertos: ${tradesAbiertos.length} | Cerrados: ${tradesCerrados.length}`);
-    
-    guardarCSV();
+  }
 }
 
-// ============================================
-// INICIAR BOT
-// ============================================
-async function iniciar() {
-    console.log(`\n🚀 BOT DE SIMULACIÓN - DATOS REALES POLYMARKET 🚀`);
-    console.log(`💰 Capital: $${CONFIG.CAPITAL_INICIAL}`);
-    console.log(`🎲 Apuesta: $${CONFIG.APUESTA_POR_TRADE}`);
-    console.log(`🛡️ Stop Loss: ${CONFIG.STOP_LOSS*100}%`);
-    console.log(`📊 Ciclo: cada ${CONFIG.CICLO_MINUTOS} min\n`);
-    
-    await ciclo();
-    setInterval(ciclo, CONFIG.CICLO_MINUTOS * 60 * 1000);
+// ================= MAIN =================
+function runBot() {
+  const markets = getMarkets();
+  const traders = getTraders();
+
+  for (const market of markets) {
+    updatePriceHistory(market);
+
+    const score = calculateScore(market, traders);
+
+    if (
+      score >= CONFIG.MIN_SCORE &&
+      openTrades.length < CONFIG.MAX_OPEN_TRADES &&
+      !openTrades.find(t => t.marketId === market.id)
+    ) {
+      console.log("✅ SCORE OK:", market.id, "score:", score);
+      openTrade(market);
+    }
+  }
+
+  for (const trade of [...openTrades]) {
+    const market = markets.find(m => m.id === trade.marketId);
+    if (market) {
+      manageTrade(trade, market.price);
+    }
+  }
+
+  console.log("💰 CAPITAL:", capital.toFixed(2));
 }
 
-iniciar();
+setInterval(runBot, 5000);
