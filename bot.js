@@ -15,9 +15,9 @@ const CONFIG = {
   PRICE_MAX: 0.70,
   MIN_LIQUIDITY: 75000,
 
-  VOLUME_SPIKE_MULTIPLIER: 2.0,
-  PRICE_MOMENTUM_MIN: 0.04,
-  LIQUIDITY_DROP_MIN: 0.05,
+  VOLUME_SPIKE_MULTIPLIER: 1.8,
+  PRICE_MOMENTUM_MIN: 0.03,
+  LIQUIDITY_DROP_MIN: 0.04,
   MIN_WHALE_SIGNALS: 2,
 
   STOP_LOSS: 0.10,
@@ -26,11 +26,14 @@ const CONFIG = {
 
   MAX_DRAWDOWN: 0.25,
 
+  COOLDOWN_AFTER_LOSSES: 3,
+  COOLDOWN_CYCLES: 3,
+
   INTERVAL_MS: 60 * 60 * 1000,
 };
 
 // ═══════════════════════════════════════
-// ESTADO
+// STATE
 // ═══════════════════════════════════════
 
 let capital = CONFIG.INITIAL_CAPITAL;
@@ -39,41 +42,43 @@ let openTrades = [];
 let closedTrades = [];
 let marketMemory = {};
 let cycle = 0;
+let lossStreak = 0;
+let cooldown = 0;
 
 // ═══════════════════════════════════════
 // UTILS
 // ═══════════════════════════════════════
 
-const now = () => new Date().toISOString().slice(0, 19).replace("T", " ");
+const now = () =>
+  new Date().toISOString().slice(0, 19).replace("T", " ");
+
 const log = (msg) => console.log(`[${now()}] ${msg}`);
 
 // ═══════════════════════════════════════
-// CSV PRO
+// CSV
 // ═══════════════════════════════════════
 
 function saveTrade(trade) {
-  const duration = (new Date(trade.exitDate) - new Date(trade.openDate)) / 1000;
+  const file = "trades.csv";
+
+  if (!fs.existsSync(file)) {
+    fs.writeFileSync(
+      file,
+      "open,close,entry,exit,pnl,reason,signals\n"
+    );
+  }
 
   const line = [
     trade.openDate,
     trade.exitDate,
-    duration,
     trade.entry,
     trade.exitPrice,
     trade.pnl,
     trade.reason,
     trade.whaleSignals ?? 0,
-    trade.slug ?? ""
   ].join(",");
 
-  if (!fs.existsSync("trades.csv")) {
-    fs.writeFileSync(
-      "trades.csv",
-      "open,close,duration_sec,entry,exit,pnl,reason,signals,market\n"
-    );
-  }
-
-  fs.appendFileSync("trades.csv", line + "\n");
+  fs.appendFileSync(file, line + "\n");
 }
 
 // ═══════════════════════════════════════
@@ -82,13 +87,17 @@ function saveTrade(trade) {
 
 async function getMarkets() {
   try {
-    const res = await fetch("https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume24hr&limit=30");
+    const res = await fetch(
+      "https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume24hr&limit=30"
+    );
+
     const data = await res.json();
 
-    return data.map(m => {
+    return data.map((m) => {
       let price = 0;
       try {
-        price = JSON.parse(m.outcomePrices || "[]")[0];
+        const prices = JSON.parse(m.outcomePrices || "[]");
+        price = prices[0] || m.lastPrice;
       } catch {
         price = m.lastPrice;
       }
@@ -100,16 +109,14 @@ async function getMarkets() {
         volume24h: parseFloat(m.volume24hr) || 0,
         liquidity: parseFloat(m.liquidity) || 0,
       };
-    });
-
+    }).filter(m => m.price > 0);
   } catch {
-    log("❌ Error API");
     return [];
   }
 }
 
 // ═══════════════════════════════════════
-// FILTROS
+// FILTRO BASE
 // ═══════════════════════════════════════
 
 function isValid(m) {
@@ -118,45 +125,45 @@ function isValid(m) {
   if (m.liquidity < CONFIG.MIN_LIQUIDITY) return false;
   if (openTrades.find(t => t.slug === m.slug)) return false;
 
-  // evitar mercados muertos
   const prev = marketMemory[m.slug];
-  if (prev) {
-    const move = Math.abs((m.price - prev.price) / prev.price);
-    if (move < 0.01) return false;
-  }
+  if (!prev) return false;
+
+  // 🔥 SOLO TENDENCIA ALCISTA
+  const move = (m.price - prev.price) / prev.price;
+  if (move < CONFIG.PRICE_MOMENTUM_MIN) return false;
 
   return true;
 }
 
 // ═══════════════════════════════════════
-// DETECTOR WHALES
+// WHALES
 // ═══════════════════════════════════════
 
 function detectWhales(m) {
   const prev = marketMemory[m.slug];
   if (!prev) return { ok: false, signals: 0 };
 
-  let signals = 0;
+  let s = 0;
 
-  if (m.volume24h > prev.volume24h * CONFIG.VOLUME_SPIKE_MULTIPLIER) signals++;
+  if (m.volume24h > prev.volume24h * CONFIG.VOLUME_SPIKE_MULTIPLIER) s++;
 
   const move = (m.price - prev.price) / prev.price;
-  if (Math.abs(move) > CONFIG.PRICE_MOMENTUM_MIN) signals++;
+  if (move > CONFIG.PRICE_MOMENTUM_MIN) s++;
 
-  if (prev.liquidity > m.liquidity * (1 + CONFIG.LIQUIDITY_DROP_MIN)) signals++;
+  if (prev.liquidity > m.liquidity * (1 + CONFIG.LIQUIDITY_DROP_MIN)) s++;
 
-  return { ok: signals >= CONFIG.MIN_WHALE_SIGNALS, signals };
+  return { ok: s >= CONFIG.MIN_WHALE_SIGNALS, signals: s };
 }
 
 // ═══════════════════════════════════════
-// TRADING
+// TRADE
 // ═══════════════════════════════════════
 
 function size() {
-  return +(capital * CONFIG.RISK_PER_TRADE).toFixed(2);
+  return Math.max(0.01, +(capital * CONFIG.RISK_PER_TRADE).toFixed(2));
 }
 
-function openTrade(m, whaleSignals) {
+function openTrade(m, signals) {
   const s = size();
   if (capital < s) return;
 
@@ -164,13 +171,12 @@ function openTrade(m, whaleSignals) {
 
   openTrades.push({
     slug: m.slug,
-    question: m.question,
     entry: m.price,
     size: s,
     peak: m.price,
     partial: false,
+    whaleSignals: signals,
     openDate: now(),
-    whaleSignals
   });
 
   log(`🟢 OPEN ${m.question} @ ${m.price}`);
@@ -182,23 +188,26 @@ function closeTrade(t, price, reason) {
 
   capital += value;
 
-  const closed = {
+  const trade = {
     ...t,
     exitPrice: price,
     exitDate: now(),
     pnl,
-    reason
+    reason,
   };
 
-  closedTrades.push(closed);
-  saveTrade(closed);
+  closedTrades.push(trade);
+  saveTrade(trade);
 
-  log(`🔴 CLOSE ${reason} | PnL: ${pnl.toFixed(2)}`);
+  if (pnl < 0) lossStreak++;
+  else lossStreak = 0;
+
+  log(`🔴 CLOSE ${reason} PnL: ${pnl.toFixed(2)}`);
 
   openTrades = openTrades.filter(x => x !== t);
 }
 
-function manage(t, price) {
+function manageTrade(t, price) {
   const pnl = (price - t.entry) / t.entry;
 
   if (pnl <= -CONFIG.STOP_LOSS) {
@@ -223,31 +232,6 @@ function manage(t, price) {
 }
 
 // ═══════════════════════════════════════
-// AUTO AJUSTE
-// ═══════════════════════════════════════
-
-function autoAdjust() {
-  if (closedTrades.length < 20) return;
-
-  const wins = closedTrades.filter(t => t.pnl > 0).length;
-  const winrate = wins / closedTrades.length;
-
-  log(`🧠 WR: ${(winrate * 100).toFixed(0)}%`);
-
-  if (winrate < 0.4) {
-    CONFIG.RISK_PER_TRADE = Math.max(0.01, CONFIG.RISK_PER_TRADE - 0.005);
-    CONFIG.MIN_WHALE_SIGNALS = Math.min(3, CONFIG.MIN_WHALE_SIGNALS + 1);
-    log("⚠ Modo defensivo");
-  }
-
-  if (winrate > 0.6) {
-    CONFIG.RISK_PER_TRADE = Math.min(0.03, CONFIG.RISK_PER_TRADE + 0.005);
-    CONFIG.MIN_WHALE_SIGNALS = Math.max(1, CONFIG.MIN_WHALE_SIGNALS - 1);
-    log("🚀 Modo agresivo");
-  }
-}
-
-// ═══════════════════════════════════════
 // RIESGO GLOBAL
 // ═══════════════════════════════════════
 
@@ -257,18 +241,18 @@ function riskControl() {
   const dd = (peakCapital - capital) / peakCapital;
 
   if (dd >= CONFIG.MAX_DRAWDOWN) {
-    log("🛑 MAX DRAWDOWN alcanzado — BOT PARADO");
-    process.exit();
+    log("🛑 STOP TOTAL (drawdown)");
+    process.exit(1);
   }
 }
 
 // ═══════════════════════════════════════
-// MAIN LOOP
+// LOOP
 // ═══════════════════════════════════════
 
 async function run() {
   cycle++;
-  log(`════ CICLO ${cycle} ════`);
+  log(`═══ CICLO ${cycle} | Capital ${capital.toFixed(2)} ═══`);
 
   const markets = await getMarkets();
   if (!markets.length) return;
@@ -276,42 +260,51 @@ async function run() {
   // gestionar trades
   for (const t of [...openTrades]) {
     const m = markets.find(x => x.slug === t.slug);
-    if (m) manage(t, m.price);
+    if (m) manageTrade(t, m.price);
   }
 
-  // nuevas entradas
-  if (openTrades.length < CONFIG.MAX_OPEN_TRADES) {
-    for (const m of markets) {
-      if (!isValid(m)) continue;
+  // cooldown
+  if (lossStreak >= CONFIG.COOLDOWN_AFTER_LOSSES) {
+    cooldown = CONFIG.COOLDOWN_CYCLES;
+    lossStreak = 0;
+    log("⏸ COOLDOWN ACTIVADO");
+  }
 
-      const whale = detectWhales(m);
-      if (!whale.ok) continue;
+  if (cooldown > 0) {
+    cooldown--;
+    log(`⏸ En cooldown (${cooldown})`);
+  } else {
+    // nuevas entradas
+    if (openTrades.length < CONFIG.MAX_OPEN_TRADES) {
+      for (const m of markets) {
+        if (!isValid(m)) continue;
 
-      openTrade(m, whale.signals);
+        const whale = detectWhales(m);
+        if (!whale.ok) continue;
 
-      if (openTrades.length >= CONFIG.MAX_OPEN_TRADES) break;
+        openTrade(m, whale.signals);
+
+        if (openTrades.length >= CONFIG.MAX_OPEN_TRADES) break;
+      }
     }
   }
 
-  // guardar memoria
+  // ⚠️ GUARDAR MEMORIA AL FINAL (FIX CLAVE)
   markets.forEach(m => {
     marketMemory[m.slug] = {
       price: m.price,
       volume24h: m.volume24h,
-      liquidity: m.liquidity
+      liquidity: m.liquidity,
     };
   });
 
-  autoAdjust();
   riskControl();
 
-  log(`💰 Capital: ${capital.toFixed(2)} | Trades abiertos: ${openTrades.length}\n`);
+  log(`📊 Capital: ${capital.toFixed(2)} | Trades: ${openTrades.length}`);
+  log("══════════════════════════════════════\n");
 }
 
-// ═══════════════════════════════════════
 // START
-// ═══════════════════════════════════════
-
-log("🚀 BOT PRO ACTIVO");
+log("🚀 BOT ELITE ACTIVO");
 run();
 setInterval(run, CONFIG.INTERVAL_MS);
