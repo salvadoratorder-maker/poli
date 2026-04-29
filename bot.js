@@ -2,7 +2,7 @@ import fetch from "node-fetch";
 import fs from "fs";
 
 // ═══════════════════════════════════════
-// CONFIG
+// CONFIG BASE (el bot la modificará solo)
 // ═══════════════════════════════════════
 
 const CONFIG = {
@@ -26,9 +26,6 @@ const CONFIG = {
 
   MAX_DRAWDOWN: 0.25,
 
-  COOLDOWN_AFTER_LOSSES: 3,
-  COOLDOWN_CYCLES: 3,
-
   INTERVAL_MS: 60 * 60 * 1000,
 };
 
@@ -41,9 +38,9 @@ let peakCapital = CONFIG.INITIAL_CAPITAL;
 let openTrades = [];
 let closedTrades = [];
 let marketMemory = {};
+
 let cycle = 0;
-let lossStreak = 0;
-let cooldown = 0;
+let tradesThisCycle = 0;
 
 // ═══════════════════════════════════════
 // UTILS
@@ -58,24 +55,18 @@ const log = (msg) => console.log(`[${now()}] ${msg}`);
 // CSV
 // ═══════════════════════════════════════
 
-function saveTrade(trade) {
+function saveTrade(t) {
   const file = "trades.csv";
 
   if (!fs.existsSync(file)) {
-    fs.writeFileSync(
-      file,
-      "open,close,entry,exit,pnl,reason,signals\n"
-    );
+    fs.writeFileSync(file, "entry,exit,pnl,signals\n");
   }
 
   const line = [
-    trade.openDate,
-    trade.exitDate,
-    trade.entry,
-    trade.exitPrice,
-    trade.pnl,
-    trade.reason,
-    trade.whaleSignals ?? 0,
+    t.entry,
+    t.exitPrice,
+    t.pnl,
+    t.whaleSignals ?? 0,
   ].join(",");
 
   fs.appendFileSync(file, line + "\n");
@@ -116,28 +107,22 @@ async function getMarkets() {
 }
 
 // ═══════════════════════════════════════
-// FILTRO BASE
+// FILTRO + WHALES
 // ═══════════════════════════════════════
 
 function isValid(m) {
   if (m.volume24h < CONFIG.MIN_VOLUME_24H) return false;
   if (m.price < CONFIG.PRICE_MIN || m.price > CONFIG.PRICE_MAX) return false;
   if (m.liquidity < CONFIG.MIN_LIQUIDITY) return false;
-  if (openTrades.find(t => t.slug === m.slug)) return false;
 
   const prev = marketMemory[m.slug];
   if (!prev) return false;
 
-  // 🔥 SOLO TENDENCIA ALCISTA
   const move = (m.price - prev.price) / prev.price;
   if (move < CONFIG.PRICE_MOMENTUM_MIN) return false;
 
   return true;
 }
-
-// ═══════════════════════════════════════
-// WHALES
-// ═══════════════════════════════════════
 
 function detectWhales(m) {
   const prev = marketMemory[m.slug];
@@ -176,33 +161,21 @@ function openTrade(m, signals) {
     peak: m.price,
     partial: false,
     whaleSignals: signals,
-    openDate: now(),
   });
 
-  log(`🟢 OPEN ${m.question} @ ${m.price}`);
+  tradesThisCycle++;
+
+  log(`🟢 OPEN ${m.question}`);
 }
 
-function closeTrade(t, price, reason) {
+function closeTrade(t, price) {
   const value = t.size * (price / t.entry);
   const pnl = value - t.size;
 
   capital += value;
 
-  const trade = {
-    ...t,
-    exitPrice: price,
-    exitDate: now(),
-    pnl,
-    reason,
-  };
-
-  closedTrades.push(trade);
-  saveTrade(trade);
-
-  if (pnl < 0) lossStreak++;
-  else lossStreak = 0;
-
-  log(`🔴 CLOSE ${reason} PnL: ${pnl.toFixed(2)}`);
+  closedTrades.push({ ...t, exitPrice: price, pnl });
+  saveTrade({ ...t, exitPrice: price, pnl });
 
   openTrades = openTrades.filter(x => x !== t);
 }
@@ -211,7 +184,7 @@ function manageTrade(t, price) {
   const pnl = (price - t.entry) / t.entry;
 
   if (pnl <= -CONFIG.STOP_LOSS) {
-    closeTrade(t, price, "STOP");
+    closeTrade(t, price);
     return;
   }
 
@@ -227,23 +200,45 @@ function manageTrade(t, price) {
 
   const drop = (t.peak - price) / t.peak;
   if (drop >= CONFIG.TRAILING_STOP) {
-    closeTrade(t, price, "TRAIL");
+    closeTrade(t, price);
   }
 }
 
 // ═══════════════════════════════════════
-// RIESGO GLOBAL
+// 🧠 AUTO ADAPTACIÓN (LA CLAVE)
 // ═══════════════════════════════════════
 
-function riskControl() {
-  if (capital > peakCapital) peakCapital = capital;
+function adapt() {
+  if (closedTrades.length < 10) return;
 
-  const dd = (peakCapital - capital) / peakCapital;
+  const last10 = closedTrades.slice(-10);
+  const wins = last10.filter(t => t.pnl > 0).length;
+  const winrate = wins / last10.length;
 
-  if (dd >= CONFIG.MAX_DRAWDOWN) {
-    log("🛑 STOP TOTAL (drawdown)");
-    process.exit(1);
+  log(`🧠 Adaptando... Winrate: ${(winrate * 100).toFixed(0)}%`);
+
+  // 🔴 MAL → más estricto
+  if (winrate < 0.4) {
+    CONFIG.MIN_WHALE_SIGNALS = Math.min(3, CONFIG.MIN_WHALE_SIGNALS + 1);
+    CONFIG.RISK_PER_TRADE = Math.max(0.01, CONFIG.RISK_PER_TRADE - 0.005);
+    log("⚠ Modo DEFENSIVO");
   }
+
+  // 🟢 BIEN → más agresivo
+  if (winrate > 0.6) {
+    CONFIG.MIN_WHALE_SIGNALS = Math.max(1, CONFIG.MIN_WHALE_SIGNALS - 1);
+    CONFIG.RISK_PER_TRADE = Math.min(0.03, CONFIG.RISK_PER_TRADE + 0.005);
+    log("🚀 Modo AGRESIVO");
+  }
+
+  // 🟡 NO OPERA → relajar filtros
+  if (tradesThisCycle === 0) {
+    CONFIG.VOLUME_SPIKE_MULTIPLIER = Math.max(1.3, CONFIG.VOLUME_SPIKE_MULTIPLIER - 0.1);
+    CONFIG.PRICE_MOMENTUM_MIN = Math.max(0.015, CONFIG.PRICE_MOMENTUM_MIN - 0.005);
+    log("🟡 Relajando filtros (no trades)");
+  }
+
+  tradesThisCycle = 0;
 }
 
 // ═══════════════════════════════════════
@@ -257,39 +252,25 @@ async function run() {
   const markets = await getMarkets();
   if (!markets.length) return;
 
-  // gestionar trades
   for (const t of [...openTrades]) {
     const m = markets.find(x => x.slug === t.slug);
     if (m) manageTrade(t, m.price);
   }
 
-  // cooldown
-  if (lossStreak >= CONFIG.COOLDOWN_AFTER_LOSSES) {
-    cooldown = CONFIG.COOLDOWN_CYCLES;
-    lossStreak = 0;
-    log("⏸ COOLDOWN ACTIVADO");
-  }
+  if (openTrades.length < CONFIG.MAX_OPEN_TRADES) {
+    for (const m of markets) {
+      if (!isValid(m)) continue;
 
-  if (cooldown > 0) {
-    cooldown--;
-    log(`⏸ En cooldown (${cooldown})`);
-  } else {
-    // nuevas entradas
-    if (openTrades.length < CONFIG.MAX_OPEN_TRADES) {
-      for (const m of markets) {
-        if (!isValid(m)) continue;
+      const whale = detectWhales(m);
+      if (!whale.ok) continue;
 
-        const whale = detectWhales(m);
-        if (!whale.ok) continue;
+      openTrade(m, whale.signals);
 
-        openTrade(m, whale.signals);
-
-        if (openTrades.length >= CONFIG.MAX_OPEN_TRADES) break;
-      }
+      if (openTrades.length >= CONFIG.MAX_OPEN_TRADES) break;
     }
   }
 
-  // ⚠️ GUARDAR MEMORIA AL FINAL (FIX CLAVE)
+  // guardar memoria (correcto)
   markets.forEach(m => {
     marketMemory[m.slug] = {
       price: m.price,
@@ -298,13 +279,13 @@ async function run() {
     };
   });
 
-  riskControl();
+  adapt();
 
   log(`📊 Capital: ${capital.toFixed(2)} | Trades: ${openTrades.length}`);
   log("══════════════════════════════════════\n");
 }
 
 // START
-log("🚀 BOT ELITE ACTIVO");
+log("🚀 BOT AUTO-ADAPTATIVO ACTIVO");
 run();
 setInterval(run, CONFIG.INTERVAL_MS);
