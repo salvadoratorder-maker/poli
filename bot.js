@@ -2,352 +2,181 @@ import fetch from "node-fetch";
 import fs from "fs";
 
 // ═══════════════════════════════════════
-// CONFIG
+// CONFIGURACIÓN
 // ═══════════════════════════════════════
 
 const CONFIG = {
   INITIAL_CAPITAL: 200,
   RISK_PER_TRADE: 0.02,
   MAX_OPEN_TRADES: 3,
-
-  MIN_VOLUME_24H: 300000,   // más suave
+  MIN_VOLUME_24H: 300000,
   PRICE_MIN: 0.20,
   PRICE_MAX: 0.80,
   MIN_LIQUIDITY: 50000,
-
-  VOLUME_SPIKE_MULTIPLIER: 1.5, // más suave
   PRICE_MOMENTUM_MIN: 0.02,
+  VOLUME_SPIKE_MULTIPLIER: 1.5,
   LIQUIDITY_DROP_MIN: 0.03,
-  MIN_WHALE_SIGNALS: 1, // más entradas
-
+  MIN_SCORE: 40,
   STOP_LOSS: 0.10,
   TAKE_PROFIT_PARTIAL: 0.15,
   TRAILING_STOP: 0.05,
-
   MAX_DRAWDOWN: 0.30,
-  FEES: 0.005, // 0.5%
-
+  MAX_HOLD_DAYS: 7,
+  FEE: 0.005,
   INTERVAL_MS: 60 * 60 * 1000,
 };
 
 // ═══════════════════════════════════════
-// ESTADO (persistente)
+// ESTADO Y PERSISTENCIA
 // ═══════════════════════════════════════
 
 let capital = CONFIG.INITIAL_CAPITAL;
-let peakCapital = CONFIG.INITIAL_CAPITAL;
+let peakEquity = CONFIG.INITIAL_CAPITAL;
 let openTrades = [];
-let closedTrades = [];
 let marketMemory = {};
 let apiFails = 0;
-let cycle = 0;
+let isPaused = false;
 
-// Cargar estado si existe
-if (fs.existsSync("state.json")) {
-  const saved = JSON.parse(fs.readFileSync("state.json"));
-  capital = saved.capital;
-  openTrades = saved.openTrades;
-  marketMemory = saved.marketMemory;
+function saveState() {
+  try {
+    fs.writeFileSync("state.json", JSON.stringify({ capital, peakEquity, openTrades, marketMemory }, null, 2));
+  } catch (err) { console.error("❌ Error guardando estado:", err.message); }
 }
 
-// ═══════════════════════════════════════
-// UTILS
-// ═══════════════════════════════════════
+function loadState() {
+  try {
+    if (fs.existsSync("state.json")) {
+      const s = JSON.parse(fs.readFileSync("state.json"));
+      capital = s.capital || CONFIG.INITIAL_CAPITAL;
+      peakEquity = s.peakEquity || CONFIG.INITIAL_CAPITAL;
+      openTrades = s.openTrades || [];
+      marketMemory = s.marketMemory || {};
+    }
+  } catch (err) { console.log("⚠️ No se pudo cargar estado, iniciando limpio."); }
+}
 
-const now = () =>
-  new Date().toISOString().slice(0, 19).replace("T", " ");
-
+const now = () => new Date().toISOString();
 const log = (msg) => console.log(`[${now()}] ${msg}`);
 
 // ═══════════════════════════════════════
-// GUARDAR ESTADO
-// ═══════════════════════════════════════
-
-function saveState() {
-  fs.writeFileSync(
-    "state.json",
-    JSON.stringify({ capital, openTrades, marketMemory }, null, 2)
-  );
-}
-
-// ═══════════════════════════════════════
-// CSV
-// ═══════════════════════════════════════
-
-function saveTrade(t) {
-  const file = "trades.csv";
-
-  if (!fs.existsSync(file)) {
-    fs.writeFileSync(
-      file,
-      "open,close,entry,exit,pnl,reason,signals\n"
-    );
-  }
-
-  const line = [
-    t.openDate,
-    t.exitDate,
-    t.entry,
-    t.exitPrice,
-    t.pnl.toFixed(2),
-    t.reason,
-    t.whaleSignals ?? 0,
-  ].join(",");
-
-  fs.appendFileSync(file, line + "\n");
-}
-
-// ═══════════════════════════════════════
-// API
+// API Y CÁLCULOS
 // ═══════════════════════════════════════
 
 async function getMarkets() {
   try {
-    const res = await fetch(
-      "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=30"
-    );
-
-    if (!res.ok) throw new Error("API fail");
-
+    const res = await fetch("https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume24hr&ascending=false&limit=30");
+    if (!res.ok) throw new Error("API error");
     const data = await res.json();
     apiFails = 0;
-
-    return data.map((m) => {
-      let price = 0;
-      try {
-        const p = JSON.parse(m.outcomePrices || "[]");
-        price = p[0] || m.lastPrice;
-      } catch {
-        price = m.lastPrice;
-      }
-
-      return {
-        slug: m.slug,
-        question: (m.question || "").slice(0, 60),
-        price: parseFloat(price) || 0,
-        volume24h: parseFloat(m.volume24hr) || 0,
-        liquidity: parseFloat(m.liquidity) || 0,
-      };
-    });
-  } catch (e) {
+    return data.map((m) => ({
+      slug: m.slug,
+      price: parseFloat(JSON.parse(m.outcomePrices || "[]")[0] || m.lastPrice) || 0,
+      volume24h: parseFloat(m.volume24hr) || 0,
+      liquidity: parseFloat(m.liquidity) || 0,
+    }));
+  } catch (err) {
     apiFails++;
-    log("❌ API ERROR");
-
-    if (apiFails >= 3) {
-      log("🛑 TOO MANY FAILS — STOP");
-      process.exit(1);
-    }
-
+    if (apiFails >= 3) process.exit(1);
     return [];
   }
 }
 
-// ═══════════════════════════════════════
-// WHALES
-// ═══════════════════════════════════════
-
-function detectWhales(m, prev) {
-  if (!prev) return { ok: false, signals: 0 };
-
-  let s = 0;
-
-  if (m.volume24h > prev.volume24h * CONFIG.VOLUME_SPIKE_MULTIPLIER) s++;
-
-  const move = (m.price - prev.price) / prev.price;
-  if (Math.abs(move) > CONFIG.PRICE_MOMENTUM_MIN) s++;
-
-  if (prev.liquidity > m.liquidity * (1 + CONFIG.LIQUIDITY_DROP_MIN)) s++;
-
-  return { ok: s >= CONFIG.MIN_WHALE_SIGNALS, signals: s };
+function getEquity(markets) {
+  let equity = capital;
+  for (const t of openTrades) {
+    const m = markets.find((x) => x.slug === t.slug);
+    equity += m ? (t.size * (m.price / t.entry)) : t.size;
+  }
+  return equity;
 }
 
-// ═══════════════════════════════════════
-// RIESGO REAL
-// ═══════════════════════════════════════
-
 function positionSize(price) {
-  const equity = getEquity();
-  const risk = equity * CONFIG.RISK_PER_TRADE;
-  const stopDist = price * CONFIG.STOP_LOSS;
-
-  let size = risk / stopDist;
-
-  // limitar tamaño
-  size = Math.min(size, equity * 0.1);
-
+  const size = Math.min((capital * CONFIG.RISK_PER_TRADE) / (price * CONFIG.STOP_LOSS), capital * 0.1);
   return Math.max(1, size);
 }
 
-function getEquity() {
-  let eq = capital;
-
-  for (const t of openTrades) {
-    eq += t.size;
-  }
-
-  return eq;
-}
-
 // ═══════════════════════════════════════
-// TRADES
+// LÓGICA DE TRADING
 // ═══════════════════════════════════════
 
-function openTrade(m, signals) {
+function openTrade(m, score) {
   const size = positionSize(m.price);
   if (capital < size) return;
-
   capital -= size;
-
-  openTrades.push({
-    slug: m.slug,
-    question: m.question,
-    entry: m.price,
-    size,
-    peak: m.price,
-    partial: false,
-    openDate: now(),
-    whaleSignals: signals,
-  });
-
-  log(`🟢 OPEN ${m.question} @ ${m.price}`);
+  openTrades.push({ slug: m.slug, entry: m.price, size, peak: m.price, openDate: now(), score, partial: false });
+  log(`🟢 OPEN ${m.slug} @ ${m.price.toFixed(3)} | score ${score}`);
 }
 
 function closeTrade(t, price, reason) {
-  const gross = t.size * (price / t.entry);
-  const fees = gross * CONFIG.FEES;
-  const pnl = gross - t.size - fees;
-
-  capital += gross - fees;
-
-  const closed = {
-    ...t,
-    exitPrice: price,
-    exitDate: now(),
-    pnl,
-    reason,
-  };
-
-  saveTrade(closed);
-  closedTrades.push(closed);
-
+  const net = (t.size * (price / t.entry)) * (1 - CONFIG.FEE);
+  capital += net;
+  log(`🔴 CLOSE ${reason} | PnL ${(net - t.size).toFixed(2)}`);
   openTrades = openTrades.filter((x) => x !== t);
-
-  log(`🔴 CLOSE ${reason} | PnL ${pnl.toFixed(2)}`);
 }
-
-// ═══════════════════════════════════════
-// GESTIÓN
-// ═══════════════════════════════════════
 
 function manageTrade(t, price) {
   const pnlPct = (price - t.entry) / t.entry;
 
-  if (pnlPct <= -CONFIG.STOP_LOSS) {
-    closeTrade(t, price, "STOP");
-    return;
-  }
+  if (pnlPct <= -CONFIG.STOP_LOSS) return closeTrade(t, price, "STOP");
+  if ((Date.now() - new Date(t.openDate)) / 86400000 > CONFIG.MAX_HOLD_DAYS) return closeTrade(t, price, "TIMEOUT");
 
   if (pnlPct >= CONFIG.TAKE_PROFIT_PARTIAL && !t.partial) {
-    const half = t.size / 2;
-    capital += half;
-    t.size /= 2;
+    const half = t.size * 0.5;
+    capital += (half * (price / t.entry)) * (1 - CONFIG.FEE);
+    t.size -= half;
     t.partial = true;
     t.peak = price;
+    log(`✂️ PARTIAL sold @ ${price.toFixed(3)}`);
     return;
   }
 
   if (price > t.peak) t.peak = price;
-
-  const drop = (t.peak - price) / t.peak;
-  if (drop >= CONFIG.TRAILING_STOP) {
-    closeTrade(t, price, "TRAIL");
-  }
+  if ((t.peak - price) / t.peak >= CONFIG.TRAILING_STOP) closeTrade(t, price, "TRAIL");
 }
 
 // ═══════════════════════════════════════
-// RIESGO GLOBAL
-// ═══════════════════════════════════════
-
-function riskControl() {
-  const eq = getEquity();
-
-  if (eq > peakCapital) peakCapital = eq;
-
-  const dd = (peakCapital - eq) / peakCapital;
-
-  if (dd > CONFIG.MAX_DRAWDOWN) {
-    log("🛑 MAX DD STOP");
-    process.exit(1);
-  }
-}
-
-// ═══════════════════════════════════════
-// LOOP
+// BUCLE PRINCIPAL
 // ═══════════════════════════════════════
 
 async function run() {
-  cycle++;
-  log(`════ CICLO ${cycle} ════`);
-
+  log("════ NUEVO CICLO ════");
   const markets = await getMarkets();
-  if (!markets.length) return next();
+  if (!markets.length) return setTimeout(run, CONFIG.INTERVAL_MS);
 
-  // snapshot anterior
   const prevMemory = { ...marketMemory };
 
-  // gestionar trades
-  for (const t of [...openTrades]) {
+  for (const t of openTrades.slice()) {
     const m = markets.find((x) => x.slug === t.slug);
     if (m) manageTrade(t, m.price);
   }
 
-  // entradas
-  if (openTrades.length < CONFIG.MAX_OPEN_TRADES) {
+  if (!isPaused && openTrades.length < CONFIG.MAX_OPEN_TRADES) {
     for (const m of markets) {
-      if (openTrades.length >= CONFIG.MAX_OPEN_TRADES) break;
-
-      if (
-        m.volume24h < CONFIG.MIN_VOLUME_24H ||
-        m.price < CONFIG.PRICE_MIN ||
-        m.price > CONFIG.PRICE_MAX ||
-        m.liquidity < CONFIG.MIN_LIQUIDITY
-      )
-        continue;
-
       if (openTrades.find((t) => t.slug === m.slug)) continue;
+      const prev = prevMemory[m.slug];
+      if (!prev || m.volume24h < prev.volume24h * 0.8 || m.volume24h < CONFIG.MIN_VOLUME_24H) continue;
 
-      const whale = detectWhales(m, prevMemory[m.slug]);
+      let score = ((Math.abs((m.price - prev.price) / prev.price) > CONFIG.PRICE_MOMENTUM_MIN) ? 30 : 0) +
+                  ((m.volume24h > prev.volume24h * CONFIG.VOLUME_SPIKE_MULTIPLIER) ? 30 : 0) +
+                  ((prev.liquidity > m.liquidity * (1 + CONFIG.LIQUIDITY_DROP_MIN)) ? 40 : 0);
 
-      if (!whale.ok) continue;
-
-      openTrade(m, whale.signals);
+      if (score >= CONFIG.MIN_SCORE) openTrade(m, score);
     }
   }
 
-  // actualizar memoria DESPUÉS
-  markets.forEach((m) => {
-    marketMemory[m.slug] = {
-      price: m.price,
-      volume24h: m.volume24h,
-      liquidity: m.liquidity,
-    };
-  });
+  markets.forEach((m) => marketMemory[m.slug] = { price: m.price, volume24h: m.volume24h, liquidity: m.liquidity });
 
-  riskControl();
+  const equity = getEquity(markets);
+  if (equity > peakEquity) peakEquity = equity;
+  const dd = (peakEquity - equity) / peakEquity;
+
+  log(`💰 Equity: ${equity.toFixed(2)} | DD: ${(dd * 100).toFixed(1)}%`);
+  if (dd > CONFIG.MAX_DRAWDOWN) { isPaused = true; log("🛑 PAUSA POR DRAWDOWN"); }
+
   saveState();
-
-  log(`💰 Capital: ${capital.toFixed(2)} | Trades: ${openTrades.length}`);
-
-  next();
-}
-
-function next() {
   setTimeout(run, CONFIG.INTERVAL_MS);
 }
 
-// ═══════════════════════════════════════
-// START
-// ═══════════════════════════════════════
-
-log("🚀 BOT FINAL PRO (estable)");
+loadState();
+log("🚀 BOT FINAL PRO READY");
 run();
