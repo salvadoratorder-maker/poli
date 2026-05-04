@@ -3,248 +3,219 @@ import fs from "fs";
 
 const CONFIG = {
   INITIAL_CAPITAL: 200,
-  RISK_PER_TRADE: 0.025,
-  MAX_SIZE_PCT: 0.06,
-  MAX_OPEN_TRADES: 4,
+  RISK_PER_TRADE: 0.02,
+  MAX_OPEN_TRADES: 3,
+  MAX_POSITIONS_PER_MARKET: 1,
 
-  MIN_VOLUME_24H: 300000,
-  PRICE_MIN: 0.25,
-  PRICE_MAX: 0.75,
-  MIN_LIQUIDITY: 100000,
+  PRICE_MIN: 0.30,
+  PRICE_MAX: 0.70,
+  MIN_VOLUME: 300000,
+  MIN_LIQ: 100000,
 
-  MIN_SCORE: 0.30,
-
-  MAX_DD: 0.30,
-  MAX_HOLD_DAYS: 5,
-  FEES: 0.005,
-  INTERVAL: 60 * 60 * 1000,
+  FEES: 0.02,
+  INTERVAL: 5 * 60 * 1000,
+  MAX_CONSECUTIVE_LOSSES: 3,
+  DRAWDOWN_LIMIT: 0.15,
 };
 
-let capital = CONFIG.INITIAL_CAPITAL;
-let openTrades = [];
-let closedTrades = [];
-let marketMemory = {};
-let priceHistory = {};
-let paused = false;
+let state = {
+  bots: {},
+  marketMemory: {},
+};
 
-const log = (m) => console.log(`[${new Date().toISOString()}] ${m}`);
+const BOTS = {
+  A: { MIN_SCORE: 0.20 },
+  B: { MIN_SCORE: 0.30 },
+  C: { MIN_SCORE: 0.25 },
+};
 
-// ═════════════════════════════════════════════════════════════
-// VOLATILIDAD
-// ═════════════════════════════════════════════════════════════
-function calcVolatility(slug) {
-  const h = priceHistory[slug] || [];
-  if (h.length < 2) return 0.01;
-
-  let moves = [];
-  for (let i = 1; i < h.length; i++) {
-    moves.push(Math.abs((h[i].price - h[i-1].price) / h[i-1].price));
-  }
-  return moves.reduce((a,b)=>a+b,0)/moves.length;
+for (const k of Object.keys(BOTS)) {
+  state.bots[k] = {
+    cash: CONFIG.INITIAL_CAPITAL,
+    openTrades: [],
+    closedTrades: [],
+    consecutiveLosses: 0,
+    peakEquity: CONFIG.INITIAL_CAPITAL,
+    paused: false,
+  };
 }
 
-// ═════════════════════════════════════════════════════════════
-// API
-// ═════════════════════════════════════════════════════════════
+function loadState() {
+  try {
+    const s = JSON.parse(fs.readFileSync("state.json"));
+    state = s;
+    for (const k of Object.keys(BOTS)) {
+      state.bots[k] ??= {
+        cash: CONFIG.INITIAL_CAPITAL,
+        openTrades: [],
+        closedTrades: [],
+        consecutiveLosses: 0,
+        peakEquity: CONFIG.INITIAL_CAPITAL,
+        paused: false,
+      };
+    }
+    log("🔁 Estado cargado");
+  } catch {
+    log("⚠️ Nuevo estado");
+  }
+}
+
+function saveState() {
+  fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
+}
+
+const ts = () => new Date().toISOString();
+const log = (m) => console.log(`[${ts()}] ${m}`);
+
+function extractPrice(m) {
+  try {
+    const raw = JSON.parse(m.outcomePrices || "[]");
+    const prices = raw.map(p => parseFloat(p)).filter(p => !isNaN(p) && p > 0 && p < 1);
+    if (prices.length === 0) return parseFloat(m.lastPrice) || 0;
+    return prices[0];
+  } catch {
+    return parseFloat(m.lastPrice) || 0;
+  }
+}
+
 async function getMarkets() {
-  const res = await fetch("https://gamma-api.polymarket.com/markets?active=true&limit=30");
+  const res = await fetch("https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=30");
   const data = await res.json();
-
-  return data.map(m => {
-    let prices = JSON.parse(m.outcomePrices || "[0]");
-    prices = prices.map(p=>parseFloat(p)).filter(p=>p>0);
-
-    let price = prices.reduce((a,b)=>
-      Math.abs(b-0.5)<Math.abs(a-0.5)?b:a, prices[0]||0
-    );
-
-    return {
-      slug: m.slug,
-      question: m.question,
-      price,
-      volume24h: parseFloat(m.volume24hr)||0,
-      liquidity: parseFloat(m.liquidity)||0
-    };
-  }).filter(m=>m.price>0);
-}
-
-// ═════════════════════════════════════════════════════════════
-// PATTERN
-// ═════════════════════════════════════════════════════════════
-function detectPattern(m) {
-  const h = priceHistory[m.slug] || [];
-  if (h.length < 2) return { type: "NONE", dir: 0 };
-
-  const p = [...h.map(x=>x.price), m.price];
-  const moves = [];
-
-  for (let i=1;i<p.length;i++){
-    moves.push((p[i]-p[i-1])/p[i-1]);
-  }
-
-  const last = moves.at(-1);
-  const prev = moves.at(-2) || 0;
-  const total = (p.at(-1)-p[0])/p[0];
-
-  // CONTINUATION
-  if (last > 0 && total > 0.02) return { type:"CONT", dir:1 };
-  if (last < 0 && total < -0.02) return { type:"CONT", dir:-1 };
-
-  // REVERSAL
-  if (prev < -0.02 && last > 0.02) return { type:"REV", dir:1 };
-  if (prev > 0.02 && last < -0.02) return { type:"REV", dir:-1 };
-
-  // PULLBACK
-  if (prev > 0 && last < 0) return { type:"PULL", dir:1 };
-  if (prev < 0 && last > 0) return { type:"PULL", dir:-1 };
-
-  return { type:"NONE", dir:0 };
-}
-
-// ═════════════════════════════════════════════════════════════
-// SCORE
-// ═════════════════════════════════════════════════════════════
-function calcScore(m) {
-  const prev = marketMemory[m.slug];
-  if (!prev) return { score:0 };
-
-  const move = (m.price - prev.price)/prev.price;
-  const volRatio = m.volume24h / prev.volume24h;
-  const pattern = detectPattern(m);
-
-  let score = 0;
-
-  // volumen
-  if (volRatio > 1.5) score += 0.3;
-
-  // patrón
-  if (pattern.type === "PULL") score += 0.4;
-  if (pattern.type === "REV")  score += 0.35;
-  if (pattern.type === "CONT") score += 0.3;
-
-  // dirección
-  score += Math.min(0.3, Math.abs(move)*5);
-
-  // aceleración (anti FOMO)
-  const accel = move - ((prev.prevMove)||0);
-  if (accel > 0.03) score -= 0.2;
-
-  return { score, pattern, move };
-}
-
-// ═════════════════════════════════════════════════════════════
-// SIZE
-// ═════════════════════════════════════════════════════════════
-function calcSize(price, sl) {
-  const risk = capital * CONFIG.RISK_PER_TRADE;
-  let size = risk / (price * sl);
-  return Math.min(size, capital * CONFIG.MAX_SIZE_PCT);
-}
-
-// ═════════════════════════════════════════════════════════════
-// OPEN
-// ═════════════════════════════════════════════════════════════
-function openTrade(m, data) {
-  const vol = calcVolatility(m.slug);
-
-  let sl = Math.max(0.05, vol);
-  let tp = sl * 1.6;
-
-  // patrón modifica
-  if (data.pattern.type === "PULL") tp *= 1.2;
-  if (data.pattern.type === "CONT") tp *= 0.8;
-
-  const size = calcSize(m.price, sl);
-
-  capital -= size;
-
-  openTrades.push({
+  return data.map(m => ({
     slug: m.slug,
-    entry: m.price,
-    size,
-    dir: data.pattern.dir,
-    sl,
-    tp,
-    peak: m.price
-  });
-
-  log(`OPEN ${data.pattern.type} ${data.pattern.dir>0?"LONG":"SHORT"} @${m.price}`);
+    price: extractPrice(m),
+    volume: Number(m.volume24hr) || 0,
+    liquidity: Number(m.liquidity) || 0,
+  }));
 }
 
-// ═════════════════════════════════════════════════════════════
-// MANAGE
-// ═════════════════════════════════════════════════════════════
-function manage(t, price) {
-  const move = (price - t.entry)/t.entry * t.dir;
+function score(m, prev, history = []) {
+  if (!prev || !prev.timestamp) return 0;
+  if (Date.now() - prev.timestamp > 2 * CONFIG.INTERVAL) return 0;
 
-  if (move <= -t.sl) return closeTrade(t, price, "SL");
-  if (move >= t.tp) return closeTrade(t, price, "TP");
+  const move = (m.price - prev.price) / prev.price;
+  const volRatio = prev.volume > 0 ? m.volume / prev.volume : 1;
+  const dist = Math.abs(m.price - 0.5);
 
-  if (price > t.peak) t.peak = price;
+  if (dist > 0.18) return 0;
 
-  if ((t.peak - price)/t.peak > 0.05) {
-    return closeTrade(t, price, "TRAIL");
+  let s = 0;
+
+  if (move > 0.01 && move <= 0.04) {
+    s += 0.35;
+  } else if (move > 0.04 && move <= 0.07) {
+    s += 0.15;
+  } else if (move > 0.07) {
+    s -= 0.25;
   }
+
+  if (volRatio > 1.3 && volRatio <= 2) {
+    s += 0.20;
+  } else if (volRatio > 2) {
+    s += 0.25;
+  }
+
+  if (dist < 0.05) {
+    s += 0.25;
+  } else if (dist < 0.10) {
+    s += 0.15;
+  } else if (dist > 0.15) {
+    s -= 0.20;
+  }
+
+  if (history.length >= 3) {
+    const prices = history.map(h => h.price).concat(m.price);
+    let up = 0;
+    for (let i = 1; i < prices.length; i++) {
+      if (prices[i] > prices[i - 1]) up++;
+    }
+    const trendStrength = up / prices.length;
+
+    if (trendStrength > 0.66) s += 0.15;
+    else if (trendStrength < 0.33) s -= 0.10;
+  }
+
+  if (Math.abs(move) < 0.005 && volRatio < 1) {
+    s -= 0.15;
+  }
+
+  return Math.max(0, Math.min(1, s));
 }
 
-// ═════════════════════════════════════════════════════════════
-// CLOSE
-// ═════════════════════════════════════════════════════════════
-function closeTrade(t, price, r) {
-  const result = t.size * (price/t.entry);
-  capital += result;
-
-  openTrades = openTrades.filter(x=>x!==t);
-
-  log(`CLOSE ${r} PnL=${(result-t.size).toFixed(2)}`);
+function equity(bot, markets) {
+  let eq = bot.cash;
+  for (const t of bot.openTrades) {
+    const m = markets.find(x => x.slug === t.slug);
+    if (!m) continue;
+    eq += t.shares * m.price;
+  }
+  return eq;
 }
 
-// ═════════════════════════════════════════════════════════════
-// LOOP
-// ═════════════════════════════════════════════════════════════
+function openTrade(bot, m, s) {
+  const size = bot.cash * CONFIG.RISK_PER_TRADE;
+  const buyFee = size * CONFIG.FEES;
+  const totalCost = size + buyFee;
+  if (bot.cash < totalCost) return;
+  bot.cash -= totalCost;
+  bot.openTrades.push({ slug: m.slug, entry: m.price, costBasis: size, shares: size / m.price, openedAt: ts() });
+  log(`🟢 OPEN ${m.slug} @${m.price.toFixed(3)} score:${s.toFixed(2)}`);
+}
+
+function closeTrade(bot, t, price, reason) {
+  const value = t.shares * price;
+  const sellFee = value * CONFIG.FEES;
+  const net = value - sellFee;
+  const pnl = net - t.costBasis;
+  bot.cash += net;
+  bot.closedTrades.push({ slug: t.slug, entry: t.entry, exit: price, size: t.costBasis, pnl, reason, openedAt: t.openedAt, closedAt: ts() });
+  bot.openTrades = bot.openTrades.filter(x => x !== t);
+  bot.consecutiveLosses = pnl < 0 ? bot.consecutiveLosses + 1 : 0;
+  if (bot.consecutiveLosses >= CONFIG.MAX_CONSECUTIVE_LOSSES) bot.paused = true;
+  log(`💰 CLOSE ${reason} pnl:$${pnl.toFixed(2)}`);
+}
+
+function manage(bot, t, price) {
+  const move = (price - t.entry) / t.entry;
+  if (move <= -0.07) return closeTrade(bot, t, price, "SL");
+  if (move >= 0.10) return closeTrade(bot, t, price, "TP");
+}
+
 async function run() {
   const markets = await getMarkets();
+  const filtered = markets.filter(m => m.price >= CONFIG.PRICE_MIN && m.price <= CONFIG.PRICE_MAX && m.volume >= CONFIG.MIN_VOLUME && m.liquidity >= CONFIG.MIN_LIQ);
+  let openMarketCounts = {};
+  for (const b of Object.values(state.bots)) for (const t of b.openTrades) openMarketCounts[t.slug] = (openMarketCounts[t.slug] || 0) + 1;
 
-  // gestionar
-  for (const t of [...openTrades]) {
-    const m = markets.find(x=>x.slug===t.slug);
-    if (m) manage(t, m.price);
+  for (const m of filtered) {
+    const prev = state.marketMemory[m.slug];
+    for (const key of Object.keys(BOTS)) {
+      const bot = state.bots[key];
+      for (const t of [...bot.openTrades]) if (t.slug === m.slug) manage(bot, t, m.price);
+      if (bot.paused) continue;
+      if (bot.openTrades.length >= CONFIG.MAX_OPEN_TRADES) continue;
+      if ((openMarketCounts[m.slug] || 0) >= CONFIG.MAX_POSITIONS_PER_MARKET) continue;
+      const s = score(m, prev);
+      if (s < BOTS[key].MIN_SCORE) continue;
+      openTrade(bot, m, s);
+      openMarketCounts[m.slug] = (openMarketCounts[m.slug] || 0) + 1;
+    }
+    state.marketMemory[m.slug] = { price: m.price, volume: m.volume, timestamp: Date.now() };
   }
 
-  // candidatos
-  let candidates = markets.map(m=>{
-    const data = calcScore(m);
-    return { m, data };
-  });
-
-  candidates = candidates
-    .filter(x=>x.data.score >= CONFIG.MIN_SCORE)
-    .sort((a,b)=>b.data.score - a.data.score)
-    .slice(0, CONFIG.MAX_OPEN_TRADES);
-
-  for (const c of candidates) {
-    if (openTrades.length >= CONFIG.MAX_OPEN_TRADES) break;
-    openTrade(c.m, c.data);
+  for (const key of Object.keys(BOTS)) {
+    const bot = state.bots[key];
+    const eq = equity(bot, markets);
+    if (eq > bot.peakEquity) bot.peakEquity = eq;
+    const dd = (bot.peakEquity - eq) / bot.peakEquity;
+    if (dd > CONFIG.DRAWDOWN_LIMIT) bot.paused = true;
+    const pnl = eq - CONFIG.INITIAL_CAPITAL;
+    log(`📊 ${key} | Cash: ${bot.cash.toFixed(2)} | Equity: ${eq.toFixed(2)} | PnL: ${pnl.toFixed(2)} | Losses: ${bot.consecutiveLosses} | Paused: ${bot.paused}`);
   }
 
-  // guardar memoria
-  markets.forEach(m=>{
-    const prev = marketMemory[m.slug] || {};
-    const move = prev.price ? (m.price-prev.price)/prev.price : 0;
-
-    marketMemory[m.slug] = {
-      price: m.price,
-      volume24h: m.volume24h,
-      prevMove: move
-    };
-
-    if (!priceHistory[m.slug]) priceHistory[m.slug]=[];
-    priceHistory[m.slug].push({price:m.price});
-    if (priceHistory[m.slug].length>6) priceHistory[m.slug].shift();
-  });
-
-  log(`Capital: ${capital.toFixed(2)}`);
+  saveState();
   setTimeout(run, CONFIG.INTERVAL);
 }
 
+loadState();
 run();
