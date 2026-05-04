@@ -1,107 +1,104 @@
 import fetch from "node-fetch";
 import fs from "fs";
 
-// ═════════════════════════════════════════════════════════════
-//  BOT v7 — Balance real (calidad + frecuencia)
-// ═════════════════════════════════════════════════════════════
-
 const CONFIG = {
-  INITIAL_CAPITAL:       200,
-  RISK_PER_TRADE:        0.02,
-  MAX_OPEN_TRADES:       3,
-  MAX_SIZE_PCT:          0.05,
+  INITIAL_CAPITAL: 200,
+  RISK_PER_TRADE: 0.025,
+  MAX_SIZE_PCT: 0.06,
+  MAX_OPEN_TRADES: 4,
 
-  MIN_VOLUME_24H:        300000,
-  PRICE_MIN:             0.25,
-  PRICE_MAX:             0.75,
-  MIN_LIQUIDITY:         40000,
-  MIN_HOURS_TO_RESOLVE:  72,
+  MIN_VOLUME_24H: 300000,
+  PRICE_MIN: 0.25,
+  PRICE_MAX: 0.75,
+  MIN_LIQUIDITY: 100000,
 
-  VOLUME_SPIKE:          1.5,
-  MOMENTUM:              0.02,
-  LIQ_DROP:              0.03,
+  MIN_SCORE: 0.30,
 
-  MIN_SCORE:             0.30,
-  MIN_TREND_CYCLES:      2,
-  MAX_SAME_CATEGORY:     1,
-
-  STOP_LOSS:             0.08,
-  TAKE_PROFIT:           0.08,
-  TRAILING:              0.04,
-
-  MAX_DD:                0.25,
-  MAX_HOLD_DAYS:         7,
-  FEES:                  0.005,
-  INTERVAL:              60 * 60 * 1000,
+  MAX_DD: 0.30,
+  MAX_HOLD_DAYS: 5,
+  FEES: 0.005,
+  INTERVAL: 60 * 60 * 1000,
 };
 
-// ═════════════════════════════════════════════════════════════
-// ESTADO
-// ═════════════════════════════════════════════════════════════
-let capital      = CONFIG.INITIAL_CAPITAL;
-let peakEquity   = CONFIG.INITIAL_CAPITAL;
-let openTrades   = [];
+let capital = CONFIG.INITIAL_CAPITAL;
+let openTrades = [];
 let closedTrades = [];
 let marketMemory = {};
 let priceHistory = {};
-let cycle        = 0;
-let paused       = false;
+let paused = false;
+
+const log = (m) => console.log(`[${new Date().toISOString()}] ${m}`);
 
 // ═════════════════════════════════════════════════════════════
-// STATE
+// VOLATILIDAD
 // ═════════════════════════════════════════════════════════════
-function loadState() {
-  try {
-    const s = JSON.parse(fs.readFileSync("state.json"));
-    capital      = s.capital      ?? CONFIG.INITIAL_CAPITAL;
-    peakEquity   = s.peakEquity   ?? CONFIG.INITIAL_CAPITAL;
-    openTrades   = s.openTrades   ?? [];
-    closedTrades = s.closedTrades ?? [];
-    marketMemory = s.marketMemory ?? {};
-    priceHistory = s.priceHistory ?? {};
-    paused       = s.paused       ?? false;
-    log(`[LOAD] Capital: $${capital.toFixed(2)} | Trades: ${openTrades.length}`);
-  } catch {
-    log("⚠ Sin estado previo");
+function calcVolatility(slug) {
+  const h = priceHistory[slug] || [];
+  if (h.length < 2) return 0.01;
+
+  let moves = [];
+  for (let i = 1; i < h.length; i++) {
+    moves.push(Math.abs((h[i].price - h[i-1].price) / h[i-1].price));
   }
-}
-
-function saveState() {
-  fs.writeFileSync("state.json", JSON.stringify({
-    capital, peakEquity, openTrades, closedTrades,
-    marketMemory, priceHistory, paused,
-  }, null, 2));
+  return moves.reduce((a,b)=>a+b,0)/moves.length;
 }
 
 // ═════════════════════════════════════════════════════════════
-// UTILS
+// API
 // ═════════════════════════════════════════════════════════════
-const ts  = () => new Date().toISOString().slice(0,19).replace("T"," ");
-const log = (msg) => console.log(`[${ts()}] ${msg}`);
+async function getMarkets() {
+  const res = await fetch("https://gamma-api.polymarket.com/markets?active=true&limit=30");
+  const data = await res.json();
 
-function equity(markets) {
-  let eq = capital;
-  for (const t of openTrades) {
-    const m = markets.find(x => x.slug === t.slug);
-    if (m) eq += t.size * (m.price / t.entry);
+  return data.map(m => {
+    let prices = JSON.parse(m.outcomePrices || "[0]");
+    prices = prices.map(p=>parseFloat(p)).filter(p=>p>0);
+
+    let price = prices.reduce((a,b)=>
+      Math.abs(b-0.5)<Math.abs(a-0.5)?b:a, prices[0]||0
+    );
+
+    return {
+      slug: m.slug,
+      question: m.question,
+      price,
+      volume24h: parseFloat(m.volume24hr)||0,
+      liquidity: parseFloat(m.liquidity)||0
+    };
+  }).filter(m=>m.price>0);
+}
+
+// ═════════════════════════════════════════════════════════════
+// PATTERN
+// ═════════════════════════════════════════════════════════════
+function detectPattern(m) {
+  const h = priceHistory[m.slug] || [];
+  if (h.length < 2) return { type: "NONE", dir: 0 };
+
+  const p = [...h.map(x=>x.price), m.price];
+  const moves = [];
+
+  for (let i=1;i<p.length;i++){
+    moves.push((p[i]-p[i-1])/p[i-1]);
   }
-  return eq;
-}
 
-// ═════════════════════════════════════════════════════════════
-// CATEGORY
-// ═════════════════════════════════════════════════════════════
-function getCategory(slug) {
-  const s = (slug || "").toLowerCase();
-  if (["nba","nfl","nhl","mlb","soccer"].some(k => s.includes(k))) return "sports";
-  if (["election","president"].some(k => s.includes(k))) return "politics";
-  if (["btc","crypto","eth"].some(k => s.includes(k))) return "crypto";
-  return "other";
-}
+  const last = moves.at(-1);
+  const prev = moves.at(-2) || 0;
+  const total = (p.at(-1)-p[0])/p[0];
 
-function isTooCorrelated(slug) {
-  const cat = getCategory(slug);
-  return openTrades.filter(t => getCategory(t.slug) === cat).length >= CONFIG.MAX_SAME_CATEGORY;
+  // CONTINUATION
+  if (last > 0 && total > 0.02) return { type:"CONT", dir:1 };
+  if (last < 0 && total < -0.02) return { type:"CONT", dir:-1 };
+
+  // REVERSAL
+  if (prev < -0.02 && last > 0.02) return { type:"REV", dir:1 };
+  if (prev > 0.02 && last < -0.02) return { type:"REV", dir:-1 };
+
+  // PULLBACK
+  if (prev > 0 && last < 0) return { type:"PULL", dir:1 };
+  if (prev < 0 && last > 0) return { type:"PULL", dir:-1 };
+
+  return { type:"NONE", dir:0 };
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -109,178 +106,145 @@ function isTooCorrelated(slug) {
 // ═════════════════════════════════════════════════════════════
 function calcScore(m) {
   const prev = marketMemory[m.slug];
-  const history = priceHistory[m.slug] || [];
+  if (!prev) return { score:0 };
+
+  const move = (m.price - prev.price)/prev.price;
+  const volRatio = m.volume24h / prev.volume24h;
+  const pattern = detectPattern(m);
+
   let score = 0;
 
-  if (!prev) return { score: 0 };
-
-  const moveShort = (m.price - prev.price) / prev.price;
-
   // volumen
-  if (m.volume24h > prev.volume24h * CONFIG.VOLUME_SPIKE) {
-    score += 0.3;
-  }
+  if (volRatio > 1.5) score += 0.3;
 
-  // tendencia
-  if (history.length >= 2) {
-    const first = history[0].price;
-    const totalMove = (m.price - first) / first;
+  // patrón
+  if (pattern.type === "PULL") score += 0.4;
+  if (pattern.type === "REV")  score += 0.35;
+  if (pattern.type === "CONT") score += 0.3;
 
-    if (Math.abs(totalMove) > CONFIG.MOMENTUM) {
-      score += 0.3;
-    }
+  // dirección
+  score += Math.min(0.3, Math.abs(move)*5);
 
-    // agotamiento
-    if (totalMove > 0.15) {
-      score -= 0.2;
-    }
-  }
+  // aceleración (anti FOMO)
+  const accel = move - ((prev.prevMove)||0);
+  if (accel > 0.03) score -= 0.2;
 
-  // liquidez
-  if (prev.liquidity > m.liquidity) {
-    score += 0.2;
-  }
-
-  // penalización picos
-  if (moveShort > 0.08) score -= 0.15;
-  else if (moveShort > 0.05) score -= 0.08;
-
-  return { score: Math.max(0, Math.min(1, score)) };
+  return { score, pattern, move };
 }
 
 // ═════════════════════════════════════════════════════════════
-// SIZE (FIX CLAVE)
+// SIZE
 // ═════════════════════════════════════════════════════════════
-function calcSize(price) {
+function calcSize(price, sl) {
   const risk = capital * CONFIG.RISK_PER_TRADE;
-  const stopDist = price * CONFIG.STOP_LOSS;
-  let s = risk / stopDist;
-
-  return Math.min(
-    capital * CONFIG.MAX_SIZE_PCT,
-    Math.max(1, parseFloat(s.toFixed(2)))
-  );
+  let size = risk / (price * sl);
+  return Math.min(size, capital * CONFIG.MAX_SIZE_PCT);
 }
 
 // ═════════════════════════════════════════════════════════════
-// TRADES
+// OPEN
 // ═════════════════════════════════════════════════════════════
-function openTrade(m) {
-  const s = calcSize(m.price);
-  if (capital < s) return;
+function openTrade(m, data) {
+  const vol = calcVolatility(m.slug);
 
-  capital -= s;
+  let sl = Math.max(0.05, vol);
+  let tp = sl * 1.6;
+
+  // patrón modifica
+  if (data.pattern.type === "PULL") tp *= 1.2;
+  if (data.pattern.type === "CONT") tp *= 0.8;
+
+  const size = calcSize(m.price, sl);
+
+  capital -= size;
 
   openTrades.push({
     slug: m.slug,
     entry: m.price,
-    size: s,
-    peak: m.price,
-    partial: false,
-    openDate: ts(),
+    size,
+    dir: data.pattern.dir,
+    sl,
+    tp,
+    peak: m.price
   });
 
-  log(`🟢 OPEN ${m.slug} @ ${m.price}`);
+  log(`OPEN ${data.pattern.type} ${data.pattern.dir>0?"LONG":"SHORT"} @${m.price}`);
 }
 
-function closeTrade(t, price, reason) {
-  const gross = t.size * (price / t.entry);
-  const fee   = gross * CONFIG.FEES;
-  const net   = gross - fee;
-
-  capital += net;
-  openTrades = openTrades.filter(x => x !== t);
-
-  log(`CLOSE ${reason} | PnL: ${(net - t.size).toFixed(2)}`);
-}
-
+// ═════════════════════════════════════════════════════════════
+// MANAGE
+// ═════════════════════════════════════════════════════════════
 function manage(t, price) {
-  const pnl = (price - t.entry) / t.entry;
-  const days = (Date.now() - new Date(t.openDate)) / 86400000;
+  const move = (price - t.entry)/t.entry * t.dir;
 
-  if (days > CONFIG.MAX_HOLD_DAYS) return closeTrade(t, price, "TIMEOUT");
-  if (pnl <= -CONFIG.STOP_LOSS) return closeTrade(t, price, "SL");
+  if (move <= -t.sl) return closeTrade(t, price, "SL");
+  if (move >= t.tp) return closeTrade(t, price, "TP");
 
-  if (pnl >= CONFIG.TAKE_PROFIT && !t.partial) {
-    const half = t.size * 0.5;
-    const value = half * (price / t.entry);
-    capital += value;
-    t.size *= 0.5;
-    t.partial = true;
-  }
+  if (price > t.peak) t.peak = price;
 
-  if (t.partial) {
-    if (price > t.peak) t.peak = price;
-    const drop = (t.peak - price) / t.peak;
-    if (drop > CONFIG.TRAILING) closeTrade(t, price, "TRAIL");
+  if ((t.peak - price)/t.peak > 0.05) {
+    return closeTrade(t, price, "TRAIL");
   }
 }
 
 // ═════════════════════════════════════════════════════════════
-// API
+// CLOSE
 // ═════════════════════════════════════════════════════════════
-async function getMarkets() {
-  try {
-    const res = await fetch("https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume24hr&ascending=false&limit=30");
-    const data = await res.json();
+function closeTrade(t, price, r) {
+  const result = t.size * (price/t.entry);
+  capital += result;
 
-    return data.map(m => ({
-      slug: m.slug,
-      price: parseFloat(JSON.parse(m.outcomePrices)[0]),
-      volume24h: parseFloat(m.volume24hr),
-      liquidity: parseFloat(m.liquidity),
-      endDate: m.endDate
-    }));
-  } catch {
-    return [];
-  }
+  openTrades = openTrades.filter(x=>x!==t);
+
+  log(`CLOSE ${r} PnL=${(result-t.size).toFixed(2)}`);
 }
 
 // ═════════════════════════════════════════════════════════════
 // LOOP
 // ═════════════════════════════════════════════════════════════
 async function run() {
-  cycle++;
-  log(`CICLO ${cycle}`);
-
   const markets = await getMarkets();
-  if (!markets.length) return setTimeout(run, CONFIG.INTERVAL);
 
+  // gestionar
   for (const t of [...openTrades]) {
-    const m = markets.find(x => x.slug === t.slug);
+    const m = markets.find(x=>x.slug===t.slug);
     if (m) manage(t, m.price);
   }
 
-  if (!paused) {
-    for (const m of markets) {
-      if (openTrades.length >= CONFIG.MAX_OPEN_TRADES) break;
-      if (isTooCorrelated(m.slug)) continue;
-
-      const { score } = calcScore(m);
-      if (score >= CONFIG.MIN_SCORE) openTrade(m);
-    }
-  }
-
-  markets.forEach(m => {
-    marketMemory[m.slug] = m;
-    if (!priceHistory[m.slug]) priceHistory[m.slug] = [];
-    priceHistory[m.slug].push(m);
-    if (priceHistory[m.slug].length > 5)
-      priceHistory[m.slug] = priceHistory[m.slug].slice(-5);
+  // candidatos
+  let candidates = markets.map(m=>{
+    const data = calcScore(m);
+    return { m, data };
   });
 
-  const eq = equity(markets);
-  if (eq > peakEquity) peakEquity = eq;
-  const dd = (peakEquity - eq) / peakEquity;
+  candidates = candidates
+    .filter(x=>x.data.score >= CONFIG.MIN_SCORE)
+    .sort((a,b)=>b.data.score - a.data.score)
+    .slice(0, CONFIG.MAX_OPEN_TRADES);
 
-  if (dd > CONFIG.MAX_DD) paused = true;
-  if (paused && dd < CONFIG.MAX_DD * 0.5) paused = false;
+  for (const c of candidates) {
+    if (openTrades.length >= CONFIG.MAX_OPEN_TRADES) break;
+    openTrade(c.m, c.data);
+  }
 
-  saveState();
+  // guardar memoria
+  markets.forEach(m=>{
+    const prev = marketMemory[m.slug] || {};
+    const move = prev.price ? (m.price-prev.price)/prev.price : 0;
+
+    marketMemory[m.slug] = {
+      price: m.price,
+      volume24h: m.volume24h,
+      prevMove: move
+    };
+
+    if (!priceHistory[m.slug]) priceHistory[m.slug]=[];
+    priceHistory[m.slug].push({price:m.price});
+    if (priceHistory[m.slug].length>6) priceHistory[m.slug].shift();
+  });
+
+  log(`Capital: ${capital.toFixed(2)}`);
   setTimeout(run, CONFIG.INTERVAL);
 }
 
-// START
-loadState();
-log("🚀 BOT v7 iniciado");
 run();
