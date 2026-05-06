@@ -16,10 +16,10 @@ const CONFIG = {
   MAX_SIZE_PCT:         0.05,
   MAX_OPEN_TRADES:      3,
 
-  MIN_VOLUME_24H:       300000,
+  MIN_VOLUME_24H:       100000, // bajado de 300K — más candidatos
   PRICE_MIN:            0.30,
   PRICE_MAX:            0.70,
-  MIN_LIQUIDITY:        75000,
+  MIN_LIQUIDITY:        30000,  // bajado de 75K — más candidatos
   MIN_HOURS_TO_RESOLVE: 48,
 
   MIN_SCORE:            0.22,
