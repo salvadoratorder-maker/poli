@@ -2,513 +2,758 @@ import fetch from "node-fetch";
 import fs from "fs";
 
 // ═════════════════════════════════════════════════════════════
-//  BOT v10 + EDGE ANALYZER - VERSIÓN CORREGIDA
-//  Cambios: CONFIG mutable, filtros por slug, métricas consistentes,
-//  persistencia completa, validaciones robustas
+// CONFIG
 // ═════════════════════════════════════════════════════════════
 
-let CONFIG = {
-  INITIAL_CAPITAL:      200,
-  RISK_PER_TRADE:       0.02,
-  MAX_SIZE_PCT:         0.05,
-  MAX_OPEN_TRADES:      3,
+const CONFIG = {
+  INITIAL_CAPITAL: 200,
 
-  MIN_VOLUME_24H:       100000,
-  PRICE_MIN:            0.30,
-  PRICE_MAX:            0.70,
-  MIN_LIQUIDITY:        30000,
-  MIN_HOURS_TO_RESOLVE: 48,
+  RISK_PER_TRADE: 0.02,
+  MAX_OPEN_TRADES: 3,
+  MAX_POSITIONS_PER_MARKET: 1,
 
-  MIN_SCORE:            0.22,
-  MIN_ENTRY_MOVE:       0.005,
+  PRICE_MIN: 0.30,
+  PRICE_MAX: 0.70,
 
-  VOLUME_SPIKE:         1.5,
-  MOMENTUM:             0.015,
+  MIN_VOLUME: 300000,
+  MIN_LIQ: 100000,
 
-  STOP_LOSS:            0.07,
-  TAKE_PROFIT:          0.10,
-  TRAILING:             0.04,
+  MIN_ENTRY_MOVE: 0.005,
+  MIN_SCORE: 0.22,
 
-  MAX_DD:               0.25,
-  MAX_HOLD_DAYS:        5,
-  FEES:                 0.005,
-  INTERVAL:             60 * 60 * 1000,
+  FEES: 0.02,
+
+  STOP_LOSS: 0.07,
+  TAKE_PROFIT: 0.10,
+
+  INTERVAL: 5 * 60 * 1000,
+
+  MAX_CONSECUTIVE_LOSSES: 3,
+  DRAWDOWN_LIMIT: 0.15,
+
+  MAX_TRADE_AGE_DAYS: 30,
 };
 
 // ═════════════════════════════════════════════════════════════
-//  ESTADO
+// STATE
 // ═════════════════════════════════════════════════════════════
-let capital      = CONFIG.INITIAL_CAPITAL;
-let peakEquity   = CONFIG.INITIAL_CAPITAL;
-let openTrades   = [];
-let closedTrades = [];
-let marketMemory = {};
-let priceHistory = {};
-let paused       = false;
-let cycle        = 0;
+
+let state = {
+  bots: {},
+  marketMemory: {},
+};
+
+const BOTS = {
+  A: { MIN_SCORE: 0.20 },
+  B: { MIN_SCORE: 0.25 },
+  C: { MIN_SCORE: 0.30 },
+};
+
+for (const key of Object.keys(BOTS)) {
+  state.bots[key] = {
+    cash: CONFIG.INITIAL_CAPITAL,
+    openTrades: [],
+    closedTrades: [],
+    consecutiveLosses: 0,
+    peakEquity: CONFIG.INITIAL_CAPITAL,
+    paused: false,
+  };
+}
 
 // ═════════════════════════════════════════════════════════════
-//  PERSISTENCE - AHORA GUARDA CONFIG ADAPTATIVA
+// UTILS
 // ═════════════════════════════════════════════════════════════
+
+const ts = () => new Date().toISOString();
+
+const log = (msg) => {
+  console.log(`[${ts()}] ${msg}`);
+};
+
+// ═════════════════════════════════════════════════════════════
+// PERSISTENCE
+// ═════════════════════════════════════════════════════════════
+
 function loadState() {
   try {
-    const s = JSON.parse(fs.readFileSync("state.json"));
-    capital      = s.capital      ?? CONFIG.INITIAL_CAPITAL;
-    peakEquity   = s.peakEquity   ?? CONFIG.INITIAL_CAPITAL;
-    openTrades   = s.openTrades   ?? [];
-    closedTrades = s.closedTrades ?? [];
-    marketMemory = s.marketMemory ?? {};
-    priceHistory = s.priceHistory ?? {};
-    paused       = s.paused       ?? false;
-    cycle        = s.cycle        ?? 0;
-    // Restaurar config adaptativa si existe
-    if (s.config) {
-      Object.assign(CONFIG, s.config);
+    const raw = fs.readFileSync("state.json");
+    const parsed = JSON.parse(raw);
+
+    state = parsed;
+
+    for (const key of Object.keys(BOTS)) {
+      state.bots[key] ??= {
+        cash: CONFIG.INITIAL_CAPITAL,
+        openTrades: [],
+        closedTrades: [],
+        consecutiveLosses: 0,
+        peakEquity: CONFIG.INITIAL_CAPITAL,
+        paused: false,
+      };
     }
-    log(`[LOAD] Capital: $${capital.toFixed(2)} | Trades: ${openTrades.length} | Cerrados: ${closedTrades.length}`);
-    log(`   Config adaptativa: Score≥${(CONFIG.MIN_SCORE*100).toFixed(0)}% | Mov≥${(CONFIG.MIN_ENTRY_MOVE*100).toFixed(1)}%`);
+
+    log("🔁 State loaded");
   } catch {
-    log("⚠ Sin estado previo — empezando de cero");
+    log("⚠️ New state created");
   }
 }
 
 function saveState() {
-  fs.writeFileSync("state.json", JSON.stringify({
-    capital, peakEquity, openTrades, closedTrades,
-    marketMemory, priceHistory, paused, cycle,
-    config: CONFIG, // Guardar config adaptativa
-  }, null, 2));
+  fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
 }
 
 // ═════════════════════════════════════════════════════════════
-//  UTILS
+// API
 // ═════════════════════════════════════════════════════════════
-const ts  = () => new Date().toISOString().slice(0, 19).replace("T", " ");
-const log = (msg) => console.log(`[${ts()}] ${msg}`);
 
-function equity(markets) {
-  let eq = capital;
-  for (const t of openTrades) {
-    const m = markets.find(x => x.slug === t.slug);
-    if (m) eq += t.size * (m.price / t.entry) - t.size;
-  }
-  return eq;
-}
+function extractPrice(m) {
+  try {
+    const raw = JSON.parse(m.outcomePrices || "[]");
 
-// ═════════════════════════════════════════════════════════════
-//  EDGE ANALYZER
-// ═════════════════════════════════════════════════════════════
-function analyzeBot() {
-  const trades = closedTrades;
+    const prices = raw
+      .map(p => parseFloat(p))
+      .filter(p => !isNaN(p) && p > 0 && p < 1);
 
-  if (trades.length < 5) {
-    return { status: "NO_DATA", message: `Solo ${trades.length}/5 trades cerrados` };
-  }
-
-  const wins   = trades.filter(t => t.pnl > 0);
-  const losses = trades.filter(t => t.pnl <= 0);
-
-  const winrate = wins.length / trades.length;
-
-  const avgWin = wins.length > 0
-    ? wins.reduce((a, t) => a + t.pnl, 0) / wins.length
-    : 0;
-
-  const avgLoss = losses.length > 0
-    ? Math.abs(losses.reduce((a, t) => a + t.pnl, 0) / losses.length)
-    : 0;
-
-  const expectancy = (winrate * avgWin) - ((1 - winrate) * avgLoss);
-  const profitFactor = avgLoss > 0
-    ? (winrate * avgWin) / ((1 - winrate) * avgLoss)
-    : 0;
-
-  const breakevenWR = avgLoss > 0
-    ? avgLoss / (avgWin + avgLoss)
-    : 0.5;
-
-  return {
-    trades,
-    winrate,
-    avgWin,
-    avgLoss,
-    expectancy,
-    profitFactor,
-    breakevenWR,
-    status: expectancy > 0 ? "EDGE" : "NO_EDGE",
-  };
-}
-
-function printEdge(analysis) {
-  if (analysis.status === "NO_DATA") {
-    log(`🔬 EDGE: ${analysis.message} — necesito más datos`);
-    return;
-  }
-
-  const statusIcon = analysis.status === "EDGE" ? "✅" : "❌";
-  const pfIcon     = analysis.profitFactor >= 1.5 ? "🟢" :
-                     analysis.profitFactor >= 1.0 ? "🟡" : "🔴";
-
-  log(`🔬 EDGE ANALYSIS (${analysis.trades.length} trades):`);
-  log(`   ${statusIcon} Status: ${analysis.status} | Expectancy: ${analysis.expectancy>=0?"+":""}$${analysis.expectancy.toFixed(3)}/trade`);
-  log(`   WR: ${(analysis.winrate*100).toFixed(1)}% (mín necesario: ${(analysis.breakevenWR*100).toFixed(1)}%)`);
-  log(`   AvgWin: +$${analysis.avgWin.toFixed(2)} | AvgLoss: -$${analysis.avgLoss.toFixed(2)}`);
-  log(`   ${pfIcon} Profit Factor: ${analysis.profitFactor.toFixed(2)} (>1.5=bueno, >2.0=muy bueno)`);
-
-  if (analysis.status === "NO_EDGE") {
-    if (analysis.winrate < analysis.breakevenWR) {
-      log(`   💡 WR demasiado bajo — el sistema acierta menos de lo necesario`);
+    if (!prices.length) {
+      return parseFloat(m.lastPrice) || 0;
     }
-    if (analysis.avgWin < analysis.avgLoss * 0.8) {
-      log(`   💡 AvgWin < AvgLoss — ganas poco cuando aciertas pero pierdes mucho`);
-    }
-  }
 
-  if (analysis.status === "EDGE") {
-    if (analysis.profitFactor < 1.3) {
-      log(`   💡 Edge pequeño — funciona pero necesita más trades para confirmarlo`);
-    } else {
-      log(`   💡 Edge sólido — el sistema está funcionando correctamente`);
-    }
+    return prices[0];
+
+  } catch {
+    return parseFloat(m.lastPrice) || 0;
   }
 }
 
-function printStats() {
-  const wins   = closedTrades.filter(t => t.pnl > 0).length;
-  const losses = closedTrades.filter(t => t.pnl <= 0).length;
-  const total  = closedTrades.length;
-  const wr     = total > 0 ? ((wins/total)*100).toFixed(0)+"%" : "—";
-  const pnl    = capital - CONFIG.INITIAL_CAPITAL;
-  const avgW   = wins > 0 ? (closedTrades.filter(t=>t.pnl>0).reduce((a,t)=>a+t.pnl,0)/wins).toFixed(2) : "—";
-  const avgL   = losses > 0 ? Math.abs(closedTrades.filter(t=>t.pnl<=0).reduce((a,t)=>a+t.pnl,0)/losses).toFixed(2) : "—";
-  log(`💰 Capital: $${capital.toFixed(2)} | PnL: ${pnl>=0?"+":""}$${pnl.toFixed(2)} | WR: ${wr} (${wins}W/${losses}L) | AvgW: +$${avgW} | AvgL: -$${avgL}`);
-}
-
-// ═════════════════════════════════════════════════════════════
-//  API
-// ═════════════════════════════════════════════════════════════
 async function getMarkets() {
   try {
+
     const res = await fetch(
-      "https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume24hr&ascending=false&limit=30"
+      "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=30"
     );
-    if (!res.ok) throw new Error("API " + res.status);
+
     const data = await res.json();
 
-    return data.map(m => {
-      let price = 0;
-      try {
-        const raw = JSON.parse(m.outcomePrices || "[0]");
-        const prices = raw.map(p => parseFloat(p)).filter(p => !isNaN(p) && p > 0);
-        price = prices.length > 0
-          ? prices.reduce((a, b) => Math.abs(b-0.5) < Math.abs(a-0.5) ? b : a, prices[0])
-          : 0;
-      } catch { price = parseFloat(m.lastPrice) || 0; }
+    return data.map(m => ({
+      slug: m.slug,
 
-      return {
-        slug:      m.slug || m.id,
-        question:  (m.question || "").slice(0, 65),
-        price,
-        volume24h: parseFloat(m.volume24hr) || 0,
-        liquidity: parseFloat(m.liquidity)  || 0,
-        endDate:   m.endDate || null,
-      };
-    }).filter(m => m.price > 0 && m.slug);
+      question: m.question || "",
+
+      price: extractPrice(m),
+
+      volume: Number(m.volume24hr) || 0,
+
+      liquidity: Number(m.liquidity) || 0,
+
+      endDate: m.endDate || null,
+    }));
 
   } catch (e) {
-    log("❌ API error: " + e.message);
+
+    log(`❌ API ERROR ${e.message}`);
+
     return [];
   }
 }
 
 // ═════════════════════════════════════════════════════════════
-//  FILTROS
+// CLEAN GHOST TRADES
 // ═════════════════════════════════════════════════════════════
-function isValid(m) {
-  if (m.price < CONFIG.PRICE_MIN || m.price > CONFIG.PRICE_MAX) return false;
-  if (m.volume24h < CONFIG.MIN_VOLUME_24H)  return false;
-  if (m.liquidity < CONFIG.MIN_LIQUIDITY)   return false;
-  if (openTrades.find(t => t.slug === m.slug)) return false;
 
-  if (m.endDate) {
-    const hoursLeft = (new Date(m.endDate) - Date.now()) / 3600000;
-    if (hoursLeft < CONFIG.MIN_HOURS_TO_RESOLVE) return false;
-  }
+async function cleanGhostTrades(markets) {
 
-  const s = (m.slug     || "").toLowerCase();
-  const q = (m.question || "").toLowerCase();
-  const liveKw = ["vs.","vs ","spread:","over/under","game ","bo3","bo5","map ","lck","lec","lcs"," g1 "," g2 "," g3 "];
-  if (liveKw.some(k => s.includes(k) || q.includes(k))) return false;
+  const validSlugs = new Set(markets.map(m => m.slug));
 
-  return true;
-}
+  for (const key of Object.keys(state.bots)) {
 
-// ═════════════════════════════════════════════════════════════
-//  VOLATILIDAD Y PATRÓN
-// ═════════════════════════════════════════════════════════════
-function calcVolatility(slug) {
-  const h = priceHistory[slug] || [];
-  if (h.length < 2) return 0.01;
-  const moves = [];
-  for (let i = 1; i < h.length; i++) {
-    const p = h[i-1].price;
-    if (p > 0) moves.push(Math.abs((h[i].price - p) / p));
-  }
-  return moves.length > 0 ? moves.reduce((a,b) => a+b, 0) / moves.length : 0.01;
-}
+    const bot = state.bots[key];
 
-function detectPattern(m) {
-  const h = priceHistory[m.slug] || [];
-  if (h.length < 2) return { type: "NONE" };
+    const cleaned = [];
 
-  const prices = [...h.map(x => x.price), m.price];
-  const moves  = [];
-  for (let i = 1; i < prices.length; i++) {
-    if (prices[i-1] > 0) moves.push((prices[i] - prices[i-1]) / prices[i-1]);
-  }
-  if (moves.length === 0) return { type: "NONE" };
+    for (const t of bot.openTrades) {
 
-  const last  = moves[moves.length - 1];
-  const prev  = moves.length > 1 ? moves[moves.length - 2] : 0;
-  const total = prices[0] > 0 ? (prices[prices.length-1] - prices[0]) / prices[0] : 0;
+      let remove = false;
 
-  if (last > 0 && total > CONFIG.MOMENTUM)               return { type: "CONT"  };
-  if (prev < -CONFIG.MOMENTUM && last > CONFIG.MOMENTUM)  return { type: "REV"   };
-  if (prev > 0 && last < 0 && last > -0.03)               return { type: "PULL"  };
-  return { type: "NONE" };
-}
+      // corrupt trade
+      if (
+        !t.slug ||
+        t.entry <= 0 ||
+        t.shares <= 0 ||
+        t.costBasis <= 0
+      ) {
+        log(`🧹 ${key} removed corrupt trade`);
+        remove = true;
+      }
 
-function calcScore(m) {
-  const prev = marketMemory[m.slug];
-  const history = priceHistory[m.slug] || [];
+      // market disappeared
+      if (!validSlugs.has(t.slug)) {
+        log(`👻 ${key} removed ghost trade ${t.slug}`);
+        remove = true;
+      }
 
-  if (!prev) {
-    return { score: m.volume24h > CONFIG.MIN_VOLUME_24H * 3 ? 0.20 : 0, pattern: { type: "NONE" }, move: 0 };
-  }
+      // stale trade
+      const age =
+        (Date.now() - new Date(t.openedAt)) / 86400000;
 
-  const move = prev.price > 0 ? (m.price - prev.price) / prev.price : 0;
-  const volRatio = prev.volume24h > 0 ? m.volume24h / prev.volume24h : 1;
-  const pattern = detectPattern(m);
-  let score = 0;
+      if (age > CONFIG.MAX_TRADE_AGE_DAYS) {
+        log(`⌛ ${key} removed stale trade ${t.slug}`);
+        remove = true;
+      }
 
-  if (move < -0.01) score -= 0.20;
-  if (volRatio > CONFIG.VOLUME_SPIKE) score += Math.min(0.30, 0.30 * (volRatio-1) / 2);
-  if (pattern.type === "PULL") score += 0.40;
-  if (pattern.type === "REV")  score += 0.35;
-  if (pattern.type === "CONT") score += 0.25;
-  score += Math.min(0.20, Math.abs(move) * 5);
+      if (remove) {
 
-  if (prev.liquidity > 0) {
-    const liqDrop = (prev.liquidity - m.liquidity) / prev.liquidity;
-    if (liqDrop > 0.03 && m.volume24h > prev.volume24h) score += Math.min(0.15, liqDrop * 2);
-  }
+        // devolver capital para evitar cash corrupto
+        bot.cash += t.costBasis;
 
-  if (move > 0.05) score -= 0.15;
-  if (history.length >= 3 && history[0].price > 0) {
-    const totalMove = (m.price - history[0].price) / history[0].price;
-    if (totalMove > 0.10) score -= 0.20;
-  }
-  if (prev.volume24h > 0 && m.volume24h < prev.volume24h * 0.85 && Math.abs(move) < 0.005) {
-    score -= 0.10;
-  }
+      } else {
 
-  return { score: Math.max(0, Math.min(1, score)), pattern, move };
-}
+        cleaned.push(t);
+      }
+    }
 
-// ═════════════════════════════════════════════════════════════
-//  POSITION SIZE
-// ═════════════════════════════════════════════════════════════
-function calcSize(price, sl) {
-  const risk = capital * CONFIG.RISK_PER_TRADE;
-  const stopDist = price * sl;
-  let size = stopDist > 0 ? risk / stopDist : risk;
-  size = Math.min(size, capital * CONFIG.MAX_SIZE_PCT);
-  return Math.max(1, parseFloat(size.toFixed(2)));
-}
-
-// ═════════════════════════════════════════════════════════════
-//  TRADES - CORREGIDO FILTRO POR SLUG
-// ═════════════════════════════════════════════════════════════
-function openTrade(m, data) {
-  const vol = calcVolatility(m.slug);
-  const sl = Math.min(0.12, Math.max(CONFIG.STOP_LOSS, vol * 1.2));
-  const tp = Math.min(0.20, Math.max(CONFIG.TAKE_PROFIT, vol * 2.0));
-  const tr = Math.min(0.07, Math.max(CONFIG.TRAILING, vol * 0.8));
-  const tpFinal = data.pattern.type === "PULL" ? tp * 1.2 : tp;
-  const size = calcSize(m.price, sl);
-
-  if (capital < size) { log(`⚠ Capital insuficiente`); return; }
-
-  capital -= size;
-
-  openTrades.push({
-    slug: m.slug, question: m.question, entry: m.price,
-    size, sl, tp: tpFinal, trailing: tr,
-    peak: m.price, partial: false, openDate: ts(),
-    pattern: data.pattern.type, score: data.score,
-  });
-
-  log(`🟢 OPEN [${data.pattern.type}] ${m.question.substring(0,50)}`);
-  log(`   @${m.price.toFixed(3)} | $${size.toFixed(2)} | SL:${(sl*100).toFixed(1)}% TP:${(tpFinal*100).toFixed(1)}% | Score:${(data.score*100).toFixed(0)}/100`);
-}
-
-function closeTrade(t, price, reason) {
-  const gross = t.size * (price / t.entry);
-  const fee = gross * CONFIG.FEES;
-  const net = gross - fee;
-  const pnl = net - t.size;
-
-  capital += net;
-  closedTrades.push({ ...t, exitPrice: price, pnl, reason, closeDate: ts() });
-  // CORREGIDO: filtro por slug (no por referencia de objeto)
-  openTrades = openTrades.filter(x => x.slug !== t.slug);
-
-  log(`${pnl>=0?"💰":"🛑"} CLOSE (${reason}): ${t.question.substring(0,45)}`);
-  log(`   @${t.entry.toFixed(3)}→@${price.toFixed(3)} | PnL: ${pnl>=0?"+":""}$${pnl.toFixed(2)} | Patrón: ${t.pattern}`);
-}
-
-function manage(t, price) {
-  const move = (price - t.entry) / t.entry;
-  const days = (Date.now() - new Date(t.openDate)) / 86400000;
-  const sl = t.sl || CONFIG.STOP_LOSS;
-  const tp = t.tp || CONFIG.TAKE_PROFIT;
-  const tr = t.trailing || CONFIG.TRAILING;
-
-  if (days > CONFIG.MAX_HOLD_DAYS) { closeTrade(t, price, `TIMEOUT_${days.toFixed(1)}d`); return; }
-  if (move <= -sl) { closeTrade(t, price, "SL"); return; }
-
-  if (move >= tp && !t.partial) {
-    const half = t.size * 0.5;
-    const value = half * (price / t.entry);
-    const fee = value * CONFIG.FEES;
-    capital += value - fee;
-    t.size -= half;
-    t.partial = true;
-    t.peak = price;
-    log(`✂️  PARTIAL @${price.toFixed(3)} | +$${(value-fee-half).toFixed(2)}`);
-    return;
-  }
-
-  if (t.partial) {
-    if (price > t.peak) t.peak = price;
-    if ((t.peak - price) / t.peak >= tr) closeTrade(t, price, "TRAIL");
+    bot.openTrades = cleaned;
   }
 }
 
 // ═════════════════════════════════════════════════════════════
-//  CICLO PRINCIPAL
+// SCORE
 // ═════════════════════════════════════════════════════════════
-async function run() {
-  cycle++;
-  log(`\n════ CICLO ${cycle} ${paused?"[PAUSADO]":""} ════`);
 
-  const markets = await getMarkets();
-  if (!markets.length) {
-    log("⚠ Sin mercados");
-    return setTimeout(run, CONFIG.INTERVAL);
+function score(m, prev) {
+
+  if (
+    !prev ||
+    !prev.timestamp ||
+    Date.now() - prev.timestamp > CONFIG.INTERVAL * 2
+  ) {
+    return 0;
   }
 
-  const prevMemory = { ...marketMemory };
+  const move =
+    prev.price > 0
+      ? (m.price - prev.price) / prev.price
+      : 0;
 
-  // 1. Gestionar trades abiertos
-  for (const t of [...openTrades]) {
+  const vol =
+    prev.volume > 0
+      ? m.volume / prev.volume
+      : 1;
+
+  const dist = Math.abs(m.price - 0.5);
+
+  let s = 0;
+
+  // bullish momentum
+  if (move > 0 && m.price < 0.65) {
+    s += 0.20;
+  }
+
+  // volume expansion
+  if (vol > 1.5) {
+    s += 0.30;
+  }
+
+  // controlled momentum
+  if (move > 0.005 && move <= 0.05) {
+    s += 0.30;
+  }
+
+  // near fair value
+  if (dist < 0.10) {
+    s += 0.15;
+  }
+
+  // too far from fair
+  if (dist > 0.15) {
+    s -= 0.30;
+  }
+
+  // extreme spike
+  if (move > 0.07) {
+    s -= 0.20;
+  }
+
+  return Math.max(0, Math.min(1, s));
+}
+
+// ═════════════════════════════════════════════════════════════
+// EQUITY
+// ═════════════════════════════════════════════════════════════
+
+function equity(bot, markets) {
+
+  let eq = bot.cash;
+
+  for (const t of bot.openTrades) {
+
     const m = markets.find(x => x.slug === t.slug);
-    if (m) manage(t, m.price);
+
+    if (!m) continue;
+
+    eq += t.shares * m.price;
   }
 
-  // 2. Buscar entradas
-  if (!paused && openTrades.length < CONFIG.MAX_OPEN_TRADES) {
-    const candidates = markets
-      .filter(m => isValid(m))
-      .filter(m => {
-        const prev = prevMemory[m.slug];
-        if (!prev) return true;
-        const move = (m.price - prev.price) / prev.price;
-        return move >= CONFIG.MIN_ENTRY_MOVE;
-      })
-      .map(m => ({ m, data: calcScore(m) }))
-      .filter(x => x.data.score >= CONFIG.MIN_SCORE)
-      .sort((a, b) => b.data.score - a.data.score);
+  return eq;
+}
 
-    let opened = 0;
-    for (const c of candidates) {
-      if (openTrades.length >= CONFIG.MAX_OPEN_TRADES) break;
-      log(`✅ [${c.data.pattern.type}] Score:${(c.data.score*100).toFixed(0)}/100 ${c.m.question.substring(0,50)}`);
-      openTrade(c.m, c.data);
-      opened++;
-    }
+// ═════════════════════════════════════════════════════════════
+// OPEN TRADE
+// ═════════════════════════════════════════════════════════════
 
-    if (opened === 0) {
-      const v = markets.filter(m => isValid(m)).length;
-      const mv = markets.filter(m => {
-        if (!isValid(m)) return false;
-        const prev = prevMemory[m.slug];
-        if (!prev) return true;
-        return (m.price - prev.price) / prev.price >= CONFIG.MIN_ENTRY_MOVE;
-      }).length;
-      log(`ℹ Sin señales | Válidos: ${v}/30 | Con movimiento: ${mv} | Con score≥${(CONFIG.MIN_SCORE*100).toFixed(0)}%: ${candidates.length}`);
-    }
-  }
+function openTrade(bot, m, s) {
 
-  // 3. Actualizar memoria
-  markets.forEach(m => {
-    const prev = marketMemory[m.slug] || {};
-    marketMemory[m.slug] = {
-      price: m.price,
-      volume24h: m.volume24h,
-      liquidity: m.liquidity,
-      prevMove: prev.price > 0 ? (m.price - prev.price) / prev.price : 0,
-    };
-    if (!priceHistory[m.slug]) priceHistory[m.slug] = [];
-    priceHistory[m.slug].push({ price: m.price, volume24h: m.volume24h });
-    if (priceHistory[m.slug].length > 6) priceHistory[m.slug].shift();
+  const size =
+    bot.cash * CONFIG.RISK_PER_TRADE;
+
+  const buyFee =
+    size * CONFIG.FEES;
+
+  const totalCost =
+    size + buyFee;
+
+  if (bot.cash < totalCost) return;
+
+  bot.cash -= totalCost;
+
+  bot.openTrades.push({
+    slug: m.slug,
+
+    entry: m.price,
+
+    costBasis: size,
+
+    shares: size / m.price,
+
+    openedAt: ts(),
   });
 
-  // 4. Equity y drawdown
-  const eq = equity(markets);
-  if (eq > peakEquity) peakEquity = eq;
-  const dd = (peakEquity - eq) / peakEquity;
-  log(`📊 Equity: $${eq.toFixed(2)} | DD: ${(dd*100).toFixed(1)}%`);
-  printStats();
+  log(
+    `🟢 OPEN ${m.slug} @${m.price.toFixed(3)} score:${s.toFixed(2)}`
+  );
+}
 
-  // 5. EDGE ANALYZER
-  const analysis = analyzeBot();
-  printEdge(analysis);
+// ═════════════════════════════════════════════════════════════
+// CLOSE TRADE
+// ═════════════════════════════════════════════════════════════
 
-  // 6. Circuit breaker
-  if (dd > CONFIG.MAX_DD && !paused) {
-    log(`⚠️  MAX DD (${(dd*100).toFixed(1)}%) — pausando entradas`);
-    paused = true;
+function closeTrade(bot, t, price, reason) {
+
+  const value =
+    t.shares * price;
+
+  const sellFee =
+    value * CONFIG.FEES;
+
+  const net =
+    value - sellFee;
+
+  const pnl =
+    net - t.costBasis;
+
+  bot.cash += net;
+
+  bot.closedTrades.push({
+    slug: t.slug,
+
+    entry: t.entry,
+
+    exit: price,
+
+    size: t.costBasis,
+
+    pnl,
+
+    reason,
+
+    openedAt: t.openedAt,
+
+    closedAt: ts(),
+  });
+
+  bot.openTrades =
+    bot.openTrades.filter(x => x !== t);
+
+  if (pnl < 0) {
+    bot.consecutiveLosses++;
+  } else {
+    bot.consecutiveLosses = 0;
   }
-  if (paused && dd < CONFIG.MAX_DD * 0.5) {
-    log(`✅ DD recuperado — reanudando`);
-    paused = false;
+
+  if (
+    bot.consecutiveLosses >=
+    CONFIG.MAX_CONSECUTIVE_LOSSES
+  ) {
+    bot.paused = true;
+
+    log(`🛑 BOT paused by losses`);
   }
 
-  // 7. Auto-ajuste basado en edge (AHORA FUNCIONA)
-  if (analysis.status === "NO_EDGE" && closedTrades.length >= 10) {
-    log(`⚙️  Auto-ajuste: sin edge en ${closedTrades.length} trades`);
-    if (analysis.winrate < analysis.breakevenWR) {
-      CONFIG.MIN_SCORE = Math.min(0.45, CONFIG.MIN_SCORE + 0.03);
-      CONFIG.MIN_ENTRY_MOVE = Math.min(0.02, CONFIG.MIN_ENTRY_MOVE + 0.002);
-      log(`   Filtros más estrictos: Score≥${(CONFIG.MIN_SCORE*100).toFixed(0)}% Mov≥${(CONFIG.MIN_ENTRY_MOVE*100).toFixed(1)}%`);
+  log(
+    `💰 CLOSE ${reason} | pnl:$${pnl.toFixed(2)}`
+  );
+}
+
+// ═════════════════════════════════════════════════════════════
+// MANAGE
+// ═════════════════════════════════════════════════════════════
+
+function manage(bot, t, price) {
+
+  const move =
+    (price - t.entry) / t.entry;
+
+  // stop loss
+  if (move <= -CONFIG.STOP_LOSS) {
+    return closeTrade(bot, t, price, "SL");
+  }
+
+  // take profit
+  if (move >= CONFIG.TAKE_PROFIT) {
+    return closeTrade(bot, t, price, "TP");
+  }
+}
+
+// ═════════════════════════════════════════════════════════════
+// ANALYZE
+// ═════════════════════════════════════════════════════════════
+
+function calculateMaxDrawdown(trades) {
+
+  let peak = 0;
+  let maxDD = 0;
+  let running = 0;
+
+  for (const t of trades) {
+
+    running += t.pnl;
+
+    if (running > peak) {
+      peak = running;
     }
-    if (analysis.avgWin < analysis.avgLoss * 0.9) {
-      CONFIG.TAKE_PROFIT = Math.min(0.18, CONFIG.TAKE_PROFIT + 0.01);
-      CONFIG.STOP_LOSS = Math.max(0.05, CONFIG.STOP_LOSS - 0.005);
-      log(`   Ratio mejorado: TP=${(CONFIG.TAKE_PROFIT*100).toFixed(0)}% SL=${(CONFIG.STOP_LOSS*100).toFixed(0)}%`);
+
+    const dd =
+      (peak - running) / (peak || 1);
+
+    if (dd > maxDD) {
+      maxDD = dd;
     }
+  }
+
+  return (maxDD * 100).toFixed(1) + "%";
+}
+
+function analyzeBot(bot) {
+
+  const trades = bot.closedTrades;
+
+  if (trades.length < 5) {
+
+    return {
+      status: "NO_DATA",
+      message: "Need more trades",
+    };
+  }
+
+  const wins =
+    trades.filter(t => t.pnl > 0);
+
+  const losses =
+    trades.filter(t => t.pnl <= 0);
+
+  const totalPnL =
+    trades.reduce((a, t) => a + t.pnl, 0);
+
+  const winrate =
+    wins.length / trades.length;
+
+  const avgWin =
+    wins.length
+      ? wins.reduce((a, t) => a + t.pnl, 0) / wins.length
+      : 0;
+
+  const avgLoss =
+    losses.length
+      ? Math.abs(
+          losses.reduce((a, t) => a + t.pnl, 0) /
+          losses.length
+        )
+      : 0;
+
+  const expectancy =
+    (winrate * avgWin) -
+    ((1 - winrate) * avgLoss);
+
+  const profitFactor =
+    avgLoss > 0
+      ? (winrate * avgWin) /
+        ((1 - winrate) * avgLoss)
+      : Infinity;
+
+  const returns =
+    trades.map(t => t.pnl);
+
+  const avgReturn =
+    totalPnL / trades.length;
+
+  const stdDev = Math.sqrt(
+    returns
+      .map(r => Math.pow(r - avgReturn, 2))
+      .reduce((a, b) => a + b, 0) /
+    trades.length
+  );
+
+  const sharpe =
+    stdDev > 0
+      ? (avgReturn / stdDev) * Math.sqrt(252)
+      : 0;
+
+  let maxLossStreak = 0;
+  let currentLossStreak = 0;
+
+  for (const t of trades) {
+
+    if (t.pnl <= 0) {
+
+      currentLossStreak++;
+
+      maxLossStreak = Math.max(
+        maxLossStreak,
+        currentLossStreak
+      );
+
+    } else {
+
+      currentLossStreak = 0;
+    }
+  }
+
+  let rating = "D";
+
+  if (
+    profitFactor > 1.5 &&
+    winrate > 0.5 &&
+    expectancy > 1
+  ) {
+    rating = "A";
+  }
+
+  else if (
+    profitFactor > 1.2 &&
+    winrate > 0.45 &&
+    expectancy > 0.5
+  ) {
+    rating = "B";
+  }
+
+  else if (
+    profitFactor > 1 &&
+    winrate > 0.4 &&
+    expectancy > 0
+  ) {
+    rating = "C";
+  }
+
+  else if (expectancy < 0) {
+    rating = "F";
+  }
+
+  return {
+
+    trades: trades.length,
+
+    totalPnL: totalPnL.toFixed(2),
+
+    winrate: (winrate * 100).toFixed(1) + "%",
+
+    avgWin: avgWin.toFixed(2),
+
+    avgLoss: avgLoss.toFixed(2),
+
+    expectancy: expectancy.toFixed(3),
+
+    profitFactor: profitFactor.toFixed(2),
+
+    sharpeRatio: sharpe.toFixed(2),
+
+    maxLossStreak,
+
+    maxDrawdown: calculateMaxDrawdown(trades),
+
+    hasEdge: expectancy > 0,
+
+    rating,
+
+    status:
+      expectancy > 0
+        ? "EDGE"
+        : "NO_EDGE",
+  };
+}
+
+// ═════════════════════════════════════════════════════════════
+// RUN
+// ═════════════════════════════════════════════════════════════
+
+async function run() {
+
+  const markets =
+    await getMarkets();
+
+  if (!markets.length) {
+
+    log("⚠️ No markets");
+
+    return setTimeout(
+      run,
+      CONFIG.INTERVAL
+    );
+  }
+
+  await cleanGhostTrades(markets);
+
+  const filtered = markets.filter(m =>
+
+    m.price >= CONFIG.PRICE_MIN &&
+    m.price <= CONFIG.PRICE_MAX &&
+
+    m.volume >= CONFIG.MIN_VOLUME &&
+
+    m.liquidity >= CONFIG.MIN_LIQ
+  );
+
+  let openMarketCounts = {};
+
+  for (const b of Object.values(state.bots)) {
+
+    for (const t of b.openTrades) {
+
+      openMarketCounts[t.slug] =
+        (openMarketCounts[t.slug] || 0) + 1;
+    }
+  }
+
+  for (const m of filtered) {
+
+    const prev =
+      state.marketMemory[m.slug];
+
+    for (const key of Object.keys(BOTS)) {
+
+      const bot =
+        state.bots[key];
+
+      // manage
+      for (const t of [...bot.openTrades]) {
+
+        if (t.slug === m.slug) {
+
+          manage(bot, t, m.price);
+        }
+      }
+
+      if (bot.paused) continue;
+
+      if (
+        bot.openTrades.length >=
+        CONFIG.MAX_OPEN_TRADES
+      ) continue;
+
+      if (
+        (openMarketCounts[m.slug] || 0) >=
+        CONFIG.MAX_POSITIONS_PER_MARKET
+      ) continue;
+
+      const s =
+        score(m, prev);
+
+      if (
+        s < BOTS[key].MIN_SCORE
+      ) continue;
+
+      openTrade(bot, m, s);
+
+      openMarketCounts[m.slug] =
+        (openMarketCounts[m.slug] || 0) + 1;
+    }
+
+    state.marketMemory[m.slug] = {
+
+      price: m.price,
+
+      volume: m.volume,
+
+      timestamp: Date.now(),
+    };
+  }
+
+  // stats
+  for (const key of Object.keys(BOTS)) {
+
+    const bot =
+      state.bots[key];
+
+    const eq =
+      equity(bot, markets);
+
+    if (eq > bot.peakEquity) {
+      bot.peakEquity = eq;
+    }
+
+    const dd =
+      (bot.peakEquity - eq) /
+      bot.peakEquity;
+
+    if (dd > CONFIG.DRAWDOWN_LIMIT) {
+
+      bot.paused = true;
+
+      log(`🛑 ${key} paused by DD`);
+    }
+
+    const pnl =
+      eq - CONFIG.INITIAL_CAPITAL;
+
+    const openValue =
+      eq - bot.cash;
+
+    log(`
+📊 BOT ${key}
+💵 Cash: $${bot.cash.toFixed(2)}
+📦 Open Value: $${openValue.toFixed(2)}
+📈 Equity: $${eq.toFixed(2)}
+📉 PnL: $${pnl.toFixed(2)}
+🔻 DD: ${(dd * 100).toFixed(1)}%
+📂 Open Trades: ${bot.openTrades.length}
+🧨 Loss Streak: ${bot.consecutiveLosses}
+⏸️ Paused: ${bot.paused}
+`);
+  }
+
+  // analyze
+  for (const key of Object.keys(BOTS)) {
+
+    const analysis =
+      analyzeBot(state.bots[key]);
+
+    log(`🤖 ${key} ANALYSIS`);
+
+    console.log(analysis);
   }
 
   saveState();
-  setTimeout(run, CONFIG.INTERVAL);
+
+  setTimeout(
+    run,
+    CONFIG.INTERVAL
+  );
 }
 
 // ═════════════════════════════════════════════════════════════
-//  START
+// START
 // ═════════════════════════════════════════════════════════════
+
 loadState();
-log(`🚀 BOT v10 + EDGE ANALYZER CORREGIDO | Capital: $${capital.toFixed(2)}`);
-log(`   Precio: ${CONFIG.PRICE_MIN}-${CONFIG.PRICE_MAX} | Liq: $${CONFIG.MIN_LIQUIDITY/1e3}K | Res: ${CONFIG.MIN_HOURS_TO_RESOLVE}h`);
-log(`   Score: ${CONFIG.MIN_SCORE*100}% | Mov: ${CONFIG.MIN_ENTRY_MOVE*100}% | TP:${CONFIG.TAKE_PROFIT*100}% SL:${CONFIG.STOP_LOSS*100}%`);
+
+log("🚀 BOT STARTED");
+
 run();
