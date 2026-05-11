@@ -1,9 +1,9 @@
 import fetch from "node-fetch";
 import fs from "fs";
 
-// ═════════════════════════════════════════════════════════════
-// CONFIG
-// ═════════════════════════════════════════════════════════════
+/* ============================================================
+   CONFIG
+============================================================ */
 
 const CONFIG = {
   INITIAL_CAPITAL: 200,
@@ -18,29 +18,21 @@ const CONFIG = {
   MIN_VOLUME: 300000,
   MIN_LIQ: 100000,
 
-  MIN_ENTRY_MOVE: 0.005,
   MIN_SCORE: 0.22,
+  MIN_ENTRY_MOVE: 0.005,
 
   FEES: 0.02,
 
   STOP_LOSS: 0.07,
   TAKE_PROFIT: 0.10,
+  TRAILING_STOP: 0.04,
 
   INTERVAL: 5 * 60 * 1000,
 
   MAX_CONSECUTIVE_LOSSES: 3,
   DRAWDOWN_LIMIT: 0.15,
 
-  MAX_TRADE_AGE_DAYS: 30,
-};
-
-// ═════════════════════════════════════════════════════════════
-// STATE
-// ═════════════════════════════════════════════════════════════
-
-let state = {
-  bots: {},
-  marketMemory: {},
+  MAX_HOLD_DAYS: 5,
 };
 
 const BOTS = {
@@ -49,8 +41,17 @@ const BOTS = {
   C: { MIN_SCORE: 0.30 },
 };
 
-for (const key of Object.keys(BOTS)) {
-  state.bots[key] = {
+/* ============================================================
+   STATE
+============================================================ */
+
+let state = {
+  bots: {},
+  marketMemory: {},
+};
+
+function createBotState() {
+  return {
     cash: CONFIG.INITIAL_CAPITAL,
     openTrades: [],
     closedTrades: [],
@@ -60,41 +61,27 @@ for (const key of Object.keys(BOTS)) {
   };
 }
 
-// ═════════════════════════════════════════════════════════════
-// UTILS
-// ═════════════════════════════════════════════════════════════
+/* ============================================================
+   UTILS
+============================================================ */
 
 const ts = () => new Date().toISOString();
+const log = m => console.log(`[${ts()}] ${m}`);
 
-const log = (msg) => {
-  console.log(`[${ts()}] ${msg}`);
-};
-
-// ═════════════════════════════════════════════════════════════
-// PERSISTENCE
-// ═════════════════════════════════════════════════════════════
+/* ============================================================
+   PERSISTENCE
+============================================================ */
 
 function loadState() {
   try {
-    const raw = fs.readFileSync("state.json");
-    const parsed = JSON.parse(raw);
-
-    state = parsed;
-
-    for (const key of Object.keys(BOTS)) {
-      state.bots[key] ??= {
-        cash: CONFIG.INITIAL_CAPITAL,
-        openTrades: [],
-        closedTrades: [],
-        consecutiveLosses: 0,
-        peakEquity: CONFIG.INITIAL_CAPITAL,
-        paused: false,
-      };
-    }
-
-    log("🔁 State loaded");
+    state = JSON.parse(fs.readFileSync("state.json"));
+    log("state loaded");
   } catch {
-    log("⚠️ New state created");
+    log("new state");
+  }
+
+  for (const k of Object.keys(BOTS)) {
+    if (!state.bots[k]) state.bots[k] = createBotState();
   }
 }
 
@@ -102,658 +89,287 @@ function saveState() {
   fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
 }
 
-// ═════════════════════════════════════════════════════════════
-// API
-// ═════════════════════════════════════════════════════════════
+/* ============================================================
+   API
+============================================================ */
 
 function extractPrice(m) {
   try {
     const raw = JSON.parse(m.outcomePrices || "[]");
 
     const prices = raw
-      .map(p => parseFloat(p))
-      .filter(p => !isNaN(p) && p > 0 && p < 1);
+      .map(Number)
+      .filter(p => p > 0 && p < 1);
 
-    if (!prices.length) {
-      return parseFloat(m.lastPrice) || 0;
-    }
+    if (!prices.length) return Number(m.lastPrice) || 0;
 
-    return prices[0];
-
+    return prices.reduce((a, b) =>
+      Math.abs(b - 0.5) < Math.abs(a - 0.5) ? b : a
+    );
   } catch {
-    return parseFloat(m.lastPrice) || 0;
+    return Number(m.lastPrice) || 0;
   }
 }
 
 async function getMarkets() {
-  try {
+  const res = await fetch(
+    "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=30"
+  );
 
-    const res = await fetch(
-      "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=30"
-    );
+  const data = await res.json();
 
-    const data = await res.json();
-
-    return data.map(m => ({
-      slug: m.slug,
-
-      question: m.question || "",
-
-      price: extractPrice(m),
-
-      volume: Number(m.volume24hr) || 0,
-
-      liquidity: Number(m.liquidity) || 0,
-
-      endDate: m.endDate || null,
-    }));
-
-  } catch (e) {
-
-    log(`❌ API ERROR ${e.message}`);
-
-    return [];
-  }
+  return data.map(m => ({
+    slug: m.slug,
+    price: extractPrice(m),
+    volume: Number(m.volume24hr) || 0,
+    liquidity: Number(m.liquidity) || 0,
+    endDate: m.endDate,
+  }));
 }
 
-// ═════════════════════════════════════════════════════════════
-// CLEAN GHOST TRADES
-// ═════════════════════════════════════════════════════════════
-
-async function cleanGhostTrades(markets) {
-
-  const validSlugs = new Set(markets.map(m => m.slug));
-
-  for (const key of Object.keys(state.bots)) {
-
-    const bot = state.bots[key];
-
-    const cleaned = [];
-
-    for (const t of bot.openTrades) {
-
-      let remove = false;
-
-      // corrupt trade
-      if (
-        !t.slug ||
-        t.entry <= 0 ||
-        t.shares <= 0 ||
-        t.costBasis <= 0
-      ) {
-        log(`🧹 ${key} removed corrupt trade`);
-        remove = true;
-      }
-
-      // market disappeared
-      if (!validSlugs.has(t.slug)) {
-        log(`👻 ${key} removed ghost trade ${t.slug}`);
-        remove = true;
-      }
-
-      // stale trade
-      const age =
-        (Date.now() - new Date(t.openedAt)) / 86400000;
-
-      if (age > CONFIG.MAX_TRADE_AGE_DAYS) {
-        log(`⌛ ${key} removed stale trade ${t.slug}`);
-        remove = true;
-      }
-
-      if (remove) {
-
-        // devolver capital para evitar cash corrupto
-        bot.cash += t.costBasis;
-
-      } else {
-
-        cleaned.push(t);
-      }
-    }
-
-    bot.openTrades = cleaned;
-  }
-}
-
-// ═════════════════════════════════════════════════════════════
-// SCORE
-// ═════════════════════════════════════════════════════════════
+/* ============================================================
+   SCORE
+============================================================ */
 
 function score(m, prev) {
+  if (!prev) return 0;
 
-  if (
-    !prev ||
-    !prev.timestamp ||
-    Date.now() - prev.timestamp > CONFIG.INTERVAL * 2
-  ) {
-    return 0;
-  }
-
-  const move =
-    prev.price > 0
-      ? (m.price - prev.price) / prev.price
-      : 0;
-
-  const vol =
-    prev.volume > 0
-      ? m.volume / prev.volume
-      : 1;
-
+  const move = (m.price - prev.price) / prev.price;
+  const vol = prev.volume > 0 ? m.volume / prev.volume : 1;
   const dist = Math.abs(m.price - 0.5);
 
   let s = 0;
 
-  // bullish momentum
-  if (move > 0 && m.price < 0.65) {
-    s += 0.20;
-  }
-
-  // volume expansion
-  if (vol > 1.5) {
-    s += 0.30;
-  }
-
-  // controlled momentum
-  if (move > 0.005 && move <= 0.05) {
-    s += 0.30;
-  }
-
-  // near fair value
-  if (dist < 0.10) {
-    s += 0.15;
-  }
-
-  // too far from fair
-  if (dist > 0.15) {
-    s -= 0.30;
-  }
-
-  // extreme spike
-  if (move > 0.07) {
-    s -= 0.20;
-  }
+  if (move > 0 && move < 0.06) s += 0.35;
+  if (vol > 1.3) s += 0.25;
+  if (dist < 0.12) s += 0.20;
+  if (move > 0.08) s -= 0.20;
+  if (dist > 0.18) s -= 0.30;
 
   return Math.max(0, Math.min(1, s));
 }
 
-// ═════════════════════════════════════════════════════════════
-// EQUITY
-// ═════════════════════════════════════════════════════════════
+/* ============================================================
+   EQUITY
+============================================================ */
 
 function equity(bot, markets) {
-
   let eq = bot.cash;
 
   for (const t of bot.openTrades) {
-
     const m = markets.find(x => x.slug === t.slug);
-
     if (!m) continue;
-
     eq += t.shares * m.price;
   }
 
   return eq;
 }
 
-// ═════════════════════════════════════════════════════════════
-// OPEN TRADE
-// ═════════════════════════════════════════════════════════════
+/* ============================================================
+   OPEN
+============================================================ */
 
 function openTrade(bot, m, s) {
+  const cost = bot.cash * CONFIG.RISK_PER_TRADE;
+  const fee = cost * CONFIG.FEES;
+  const total = cost + fee;
 
-  const size =
-    bot.cash * CONFIG.RISK_PER_TRADE;
+  if (bot.cash < total) return;
 
-  const buyFee =
-    size * CONFIG.FEES;
-
-  const totalCost =
-    size + buyFee;
-
-  if (bot.cash < totalCost) return;
-
-  bot.cash -= totalCost;
+  bot.cash -= total;
 
   bot.openTrades.push({
     slug: m.slug,
-
     entry: m.price,
-
-    costBasis: size,
-
-    shares: size / m.price,
-
+    costBasis: cost,
+    shares: cost / m.price,
+    peak: m.price,
     openedAt: ts(),
   });
 
-  log(
-    `🟢 OPEN ${m.slug} @${m.price.toFixed(3)} score:${s.toFixed(2)}`
-  );
+  log(`OPEN ${m.slug} score=${s.toFixed(2)}`);
 }
 
-// ═════════════════════════════════════════════════════════════
-// CLOSE TRADE
-// ═════════════════════════════════════════════════════════════
+/* ============================================================
+   CLOSE
+============================================================ */
 
 function closeTrade(bot, t, price, reason) {
-
-  const value =
-    t.shares * price;
-
-  const sellFee =
-    value * CONFIG.FEES;
-
-  const net =
-    value - sellFee;
-
-  const pnl =
-    net - t.costBasis;
+  const gross = t.shares * price;
+  const fee = gross * CONFIG.FEES;
+  const net = gross - fee;
+  const pnl = net - t.costBasis;
 
   bot.cash += net;
 
   bot.closedTrades.push({
-    slug: t.slug,
-
-    entry: t.entry,
-
+    ...t,
     exit: price,
-
-    size: t.costBasis,
-
     pnl,
-
     reason,
-
-    openedAt: t.openedAt,
-
     closedAt: ts(),
   });
 
-  bot.openTrades =
-    bot.openTrades.filter(x => x !== t);
+  bot.openTrades = bot.openTrades.filter(x => x !== t);
 
-  if (pnl < 0) {
-    bot.consecutiveLosses++;
-  } else {
-    bot.consecutiveLosses = 0;
-  }
+  bot.consecutiveLosses =
+    pnl < 0 ? bot.consecutiveLosses + 1 : 0;
 
   if (
     bot.consecutiveLosses >=
     CONFIG.MAX_CONSECUTIVE_LOSSES
   ) {
     bot.paused = true;
-
-    log(`🛑 BOT paused by losses`);
   }
 
-  log(
-    `💰 CLOSE ${reason} | pnl:$${pnl.toFixed(2)}`
-  );
+  log(`CLOSE ${reason} pnl=${pnl.toFixed(2)}`);
 }
 
-// ═════════════════════════════════════════════════════════════
-// MANAGE
-// ═════════════════════════════════════════════════════════════
+/* ============================================================
+   MANAGE
+============================================================ */
 
 function manage(bot, t, price) {
+  const move = (price - t.entry) / t.entry;
 
-  const move =
-    (price - t.entry) / t.entry;
+  if (price > t.peak) t.peak = price;
 
-  // stop loss
-  if (move <= -CONFIG.STOP_LOSS) {
+  const trail =
+    (t.peak - price) / t.peak;
+
+  const age =
+    (Date.now() - new Date(t.openedAt)) /
+    86400000;
+
+  if (move <= -CONFIG.STOP_LOSS)
     return closeTrade(bot, t, price, "SL");
-  }
 
-  // take profit
-  if (move >= CONFIG.TAKE_PROFIT) {
+  if (move >= CONFIG.TAKE_PROFIT)
     return closeTrade(bot, t, price, "TP");
-  }
-}
-
-// ═════════════════════════════════════════════════════════════
-// ANALYZE
-// ═════════════════════════════════════════════════════════════
-
-function calculateMaxDrawdown(trades) {
-
-  let peak = 0;
-  let maxDD = 0;
-  let running = 0;
-
-  for (const t of trades) {
-
-    running += t.pnl;
-
-    if (running > peak) {
-      peak = running;
-    }
-
-    const dd =
-      (peak - running) / (peak || 1);
-
-    if (dd > maxDD) {
-      maxDD = dd;
-    }
-  }
-
-  return (maxDD * 100).toFixed(1) + "%";
-}
-
-function analyzeBot(bot) {
-
-  const trades = bot.closedTrades;
-
-  if (trades.length < 5) {
-
-    return {
-      status: "NO_DATA",
-      message: "Need more trades",
-    };
-  }
-
-  const wins =
-    trades.filter(t => t.pnl > 0);
-
-  const losses =
-    trades.filter(t => t.pnl <= 0);
-
-  const totalPnL =
-    trades.reduce((a, t) => a + t.pnl, 0);
-
-  const winrate =
-    wins.length / trades.length;
-
-  const avgWin =
-    wins.length
-      ? wins.reduce((a, t) => a + t.pnl, 0) / wins.length
-      : 0;
-
-  const avgLoss =
-    losses.length
-      ? Math.abs(
-          losses.reduce((a, t) => a + t.pnl, 0) /
-          losses.length
-        )
-      : 0;
-
-  const expectancy =
-    (winrate * avgWin) -
-    ((1 - winrate) * avgLoss);
-
-  const profitFactor =
-    avgLoss > 0
-      ? (winrate * avgWin) /
-        ((1 - winrate) * avgLoss)
-      : Infinity;
-
-  const returns =
-    trades.map(t => t.pnl);
-
-  const avgReturn =
-    totalPnL / trades.length;
-
-  const stdDev = Math.sqrt(
-    returns
-      .map(r => Math.pow(r - avgReturn, 2))
-      .reduce((a, b) => a + b, 0) /
-    trades.length
-  );
-
-  const sharpe =
-    stdDev > 0
-      ? (avgReturn / stdDev) * Math.sqrt(252)
-      : 0;
-
-  let maxLossStreak = 0;
-  let currentLossStreak = 0;
-
-  for (const t of trades) {
-
-    if (t.pnl <= 0) {
-
-      currentLossStreak++;
-
-      maxLossStreak = Math.max(
-        maxLossStreak,
-        currentLossStreak
-      );
-
-    } else {
-
-      currentLossStreak = 0;
-    }
-  }
-
-  let rating = "D";
 
   if (
-    profitFactor > 1.5 &&
-    winrate > 0.5 &&
-    expectancy > 1
-  ) {
-    rating = "A";
-  }
+    move > 0.04 &&
+    trail >= CONFIG.TRAILING_STOP
+  )
+    return closeTrade(bot, t, price, "TRAIL");
 
-  else if (
-    profitFactor > 1.2 &&
-    winrate > 0.45 &&
-    expectancy > 0.5
-  ) {
-    rating = "B";
-  }
-
-  else if (
-    profitFactor > 1 &&
-    winrate > 0.4 &&
-    expectancy > 0
-  ) {
-    rating = "C";
-  }
-
-  else if (expectancy < 0) {
-    rating = "F";
-  }
-
-  return {
-
-    trades: trades.length,
-
-    totalPnL: totalPnL.toFixed(2),
-
-    winrate: (winrate * 100).toFixed(1) + "%",
-
-    avgWin: avgWin.toFixed(2),
-
-    avgLoss: avgLoss.toFixed(2),
-
-    expectancy: expectancy.toFixed(3),
-
-    profitFactor: profitFactor.toFixed(2),
-
-    sharpeRatio: sharpe.toFixed(2),
-
-    maxLossStreak,
-
-    maxDrawdown: calculateMaxDrawdown(trades),
-
-    hasEdge: expectancy > 0,
-
-    rating,
-
-    status:
-      expectancy > 0
-        ? "EDGE"
-        : "NO_EDGE",
-  };
+  if (age > CONFIG.MAX_HOLD_DAYS)
+    return closeTrade(bot, t, price, "TIME");
 }
 
-// ═════════════════════════════════════════════════════════════
-// RUN
-// ═════════════════════════════════════════════════════════════
+/* ============================================================
+   CLEAN GHOSTS
+============================================================ */
 
-async function run() {
+function cleanGhostTrades(markets) {
+  const valid = new Set(markets.map(m => m.slug));
 
-  const markets =
-    await getMarkets();
-
-  if (!markets.length) {
-
-    log("⚠️ No markets");
-
-    return setTimeout(
-      run,
-      CONFIG.INTERVAL
+  for (const bot of Object.values(state.bots)) {
+    bot.openTrades = bot.openTrades.filter(t =>
+      valid.has(t.slug)
     );
   }
+}
 
-  await cleanGhostTrades(markets);
+/* ============================================================
+   RUN
+============================================================ */
 
-  const filtered = markets.filter(m =>
+async function run() {
+  const markets = await getMarkets();
 
-    m.price >= CONFIG.PRICE_MIN &&
-    m.price <= CONFIG.PRICE_MAX &&
+  cleanGhostTrades(markets);
 
-    m.volume >= CONFIG.MIN_VOLUME &&
-
-    m.liquidity >= CONFIG.MIN_LIQ
+  const filtered = markets.filter(
+    m =>
+      m.price >= CONFIG.PRICE_MIN &&
+      m.price <= CONFIG.PRICE_MAX &&
+      m.volume >= CONFIG.MIN_VOLUME &&
+      m.liquidity >= CONFIG.MIN_LIQ
   );
 
-  let openMarketCounts = {};
+  const marketCount = {};
 
   for (const b of Object.values(state.bots)) {
-
-    for (const t of b.openTrades) {
-
-      openMarketCounts[t.slug] =
-        (openMarketCounts[t.slug] || 0) + 1;
-    }
+    for (const t of b.openTrades)
+      marketCount[t.slug] =
+        (marketCount[t.slug] || 0) + 1;
   }
 
   for (const m of filtered) {
+    const prev = state.marketMemory[m.slug];
 
-    const prev =
-      state.marketMemory[m.slug];
+    for (const k of Object.keys(BOTS)) {
+      const bot = state.bots[k];
 
-    for (const key of Object.keys(BOTS)) {
-
-      const bot =
-        state.bots[key];
-
-      // manage
       for (const t of [...bot.openTrades]) {
-
-        if (t.slug === m.slug) {
-
+        if (t.slug === m.slug)
           manage(bot, t, m.price);
-        }
       }
 
       if (bot.paused) continue;
-
       if (
         bot.openTrades.length >=
         CONFIG.MAX_OPEN_TRADES
-      ) continue;
+      )
+        continue;
 
       if (
-        (openMarketCounts[m.slug] || 0) >=
+        (marketCount[m.slug] || 0) >=
         CONFIG.MAX_POSITIONS_PER_MARKET
-      ) continue;
+      )
+        continue;
 
-      const s =
-        score(m, prev);
+      const s = score(m, prev);
 
-      if (
-        s < BOTS[key].MIN_SCORE
-      ) continue;
+      if (s < BOTS[k].MIN_SCORE)
+        continue;
 
       openTrade(bot, m, s);
 
-      openMarketCounts[m.slug] =
-        (openMarketCounts[m.slug] || 0) + 1;
+      marketCount[m.slug] =
+        (marketCount[m.slug] || 0) + 1;
     }
 
     state.marketMemory[m.slug] = {
-
       price: m.price,
-
       volume: m.volume,
-
-      timestamp: Date.now(),
+      ts: Date.now(),
     };
   }
 
-  // stats
-  for (const key of Object.keys(BOTS)) {
+  for (const k of Object.keys(BOTS)) {
+    const bot = state.bots[k];
 
-    const bot =
-      state.bots[key];
+    const eq = equity(bot, markets);
 
-    const eq =
-      equity(bot, markets);
-
-    if (eq > bot.peakEquity) {
+    if (eq > bot.peakEquity)
       bot.peakEquity = eq;
-    }
 
     const dd =
       (bot.peakEquity - eq) /
       bot.peakEquity;
 
-    if (dd > CONFIG.DRAWDOWN_LIMIT) {
-
+    if (dd > CONFIG.DRAWDOWN_LIMIT)
       bot.paused = true;
 
-      log(`🛑 ${key} paused by DD`);
-    }
-
-    const pnl =
-      eq - CONFIG.INITIAL_CAPITAL;
-
-    const openValue =
-      eq - bot.cash;
-
-    log(`
-📊 BOT ${key}
-💵 Cash: $${bot.cash.toFixed(2)}
-📦 Open Value: $${openValue.toFixed(2)}
-📈 Equity: $${eq.toFixed(2)}
-📉 PnL: $${pnl.toFixed(2)}
-🔻 DD: ${(dd * 100).toFixed(1)}%
-📂 Open Trades: ${bot.openTrades.length}
-🧨 Loss Streak: ${bot.consecutiveLosses}
-⏸️ Paused: ${bot.paused}
-`);
-  }
-
-  // analyze
-  for (const key of Object.keys(BOTS)) {
-
-    const analysis =
-      analyzeBot(state.bots[key]);
-
-    log(`🤖 ${key} ANALYSIS`);
-
-    console.log(analysis);
+    log(
+      `${k} cash=${bot.cash.toFixed(
+        2
+      )} eq=${eq.toFixed(2)} dd=${(
+        dd * 100
+      ).toFixed(1)}%`
+    );
   }
 
   saveState();
 
-  setTimeout(
-    run,
-    CONFIG.INTERVAL
-  );
+  setTimeout(run, CONFIG.INTERVAL);
 }
 
-// ═════════════════════════════════════════════════════════════
-// START
-// ═════════════════════════════════════════════════════════════
+/* ============================================================
+   START
+============================================================ */
 
 loadState();
-
-log("🚀 BOT STARTED");
-
 run();
