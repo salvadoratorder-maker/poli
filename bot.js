@@ -1,33 +1,25 @@
 import fetch from "node-fetch";
 import fs from "fs";
 
-let CONFIG = {
-  INITIAL_CAPITAL: 200,
+const INSTANCE_ID = `${process.pid}-${Date.now()}`;
+const STATE_FILE = `state.${INSTANCE_ID}.json`;
 
+const CONFIG = {
+  INITIAL_CAPITAL: 200,
   RISK_PER_TRADE: 0.02,
   MAX_OPEN_TRADES: 3,
   MAX_POSITIONS_PER_MARKET: 1,
-
   PRICE_MIN: 0.30,
   PRICE_MAX: 0.70,
-
   MIN_VOLUME: 300000,
   MIN_LIQ: 100000,
-
-  MIN_SCORE: 0.22,
-
-  FEES: 0.005,
-
-  STOP_LOSS: 0.07,
-  TAKE_PROFIT: 0.10,
-  TRAILING_STOP: 0.04,
-
-  INTERVAL: 30 * 60 * 1000,
-
+  FEES: 0.02,
+  INTERVAL: 5 * 60 * 1000,
   MAX_CONSECUTIVE_LOSSES: 3,
   DRAWDOWN_LIMIT: 0.15,
-
-  MAX_HOLD_DAYS: 5,
+  STOP_LOSS: 0.03,
+  TAKE_PROFIT: 0.05,
+  MAX_HOLD_HOURS: 24,
 };
 
 const BOTS = {
@@ -36,12 +28,12 @@ const BOTS = {
   C: { MIN_SCORE: 0.30 },
 };
 
-let state = {
-  bots: {},
-  marketMemory: {},
-};
+let state = { bots: {}, marketMemory: {} };
 
-function createBotState() {
+const ts = () => new Date().toISOString();
+const log = m => console.log(`[${INSTANCE_ID}] [${ts()}] ${m}`);
+
+function initBot() {
   return {
     cash: CONFIG.INITIAL_CAPITAL,
     openTrades: [],
@@ -52,253 +44,119 @@ function createBotState() {
   };
 }
 
-const ts = () => new Date().toISOString();
-const log = m => console.log(`[${ts()}] ${m}`);
+for (const k of Object.keys(BOTS)) state.bots[k] = initBot();
 
 function loadState() {
   try {
-    state = JSON.parse(fs.readFileSync("state.json"));
-  } catch {}
+    state = JSON.parse(fs.readFileSync(STATE_FILE));
+    for (const k of Object.keys(BOTS)) state.bots[k] ??= initBot();
+    log("STATE LOADED");
+  } catch { log("NEW STATE"); }
+}
 
-  for (const k of Object.keys(BOTS)) {
-    if (!state.bots[k]) {
-      state.bots[k] = createBotState();
+const saveState = () => fs.writeFileSync(STATE_FILE, JSON.stringify(state,null,2));
+
+function extractPrice(m){
+  try{
+    const p=JSON.parse(m.outcomePrices||'[]').map(Number).filter(x=>x>0&&x<1);
+    return p[0]||Number(m.lastPrice)||0;
+  }catch{return Number(m.lastPrice)||0}
+}
+
+async function getMarkets(){
+  const r=await fetch("https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=30");
+  const d=await r.json();
+  return d.map(m=>({slug:m.slug,price:extractPrice(m),volume:+m.volume24hr||0,liquidity:+m.liquidity||0}));
+}
+
+function score(m,p){
+  if(!p||!p.timestamp||p.price<=0)return 0;
+  if(Date.now()-p.timestamp>2*CONFIG.INTERVAL)return 0;
+  const move=(m.price-p.price)/p.price;
+  const vol=p.volume>0?m.volume/p.volume:1;
+  const dist=Math.abs(m.price-.5);
+  let s=0;
+  if(move>0&&m.price<.65)s+=.25;
+  if(vol>1.5)s+=.25;
+  if(move>.005&&move<=.05)s+=.30;
+  if(dist>.15)s-=.25;
+  if(move>.07)s-=.15;
+  return Math.max(0,Math.min(1,s));
+}
+
+function equity(bot,markets){
+  let e=bot.cash;
+  for(const t of bot.openTrades){
+    const m=markets.find(x=>x.slug===t.slug);
+    if(m)e+=t.shares*m.price;
+  }
+  return e;
+}
+
+function duplicate(slug){
+  return Object.values(state.bots).flatMap(b=>b.openTrades).find(t=>t.slug===slug);
+}
+
+function openTrade(bot,key,m,s){
+  if(duplicate(m.slug)){log(`DUPLICATE BLOCKED ${m.slug}`);return false;}
+  const size=bot.cash*CONFIG.RISK_PER_TRADE;
+  const fee=size*CONFIG.FEES;
+  if(bot.cash<size+fee)return false;
+  bot.cash-=size+fee;
+  bot.openTrades.push({slug:m.slug,entry:m.price,costBasis:size,shares:size/m.price,openedAt:ts(),score:s,bot:key,instance:INSTANCE_ID});
+  log(`OPEN ${key} ${m.slug} @${m.price.toFixed(3)} score:${s.toFixed(2)}`);
+  return true;
+}
+
+function closeTrade(bot,t,price,reason){
+  const value=t.shares*price;
+  const fee=value*CONFIG.FEES;
+  const net=value-fee;
+  const pnl=net-t.costBasis;
+  bot.cash+=net;
+  bot.closedTrades.push({...t,exit:price,pnl,reason,closedAt:ts(),durationHours:(Date.now()-new Date(t.openedAt))/3600000});
+  bot.openTrades=bot.openTrades.filter(x=>x!==t);
+  bot.consecutiveLosses=pnl<0?bot.consecutiveLosses+1:0;
+  if(bot.consecutiveLosses>=CONFIG.MAX_CONSECUTIVE_LOSSES)bot.paused=true;
+  log(`CLOSE ${reason} pnl:${pnl.toFixed(2)}`);
+}
+
+function manage(bot,t,p){
+  const move=(p-t.entry)/t.entry;
+  const age=(Date.now()-new Date(t.openedAt))/3600000;
+  if(age>CONFIG.MAX_HOLD_HOURS)return closeTrade(bot,t,p,'TIMEOUT');
+  if(move<=-CONFIG.STOP_LOSS)return closeTrade(bot,t,p,'SL');
+  if(move>=CONFIG.TAKE_PROFIT)return closeTrade(bot,t,p,'TP');
+}
+
+async function run(){
+  let opens=0,closes=0,dupes=0;
+  const mkts=await getMarkets();
+  const filtered=mkts.filter(m=>m.price>=CONFIG.PRICE_MIN&&m.price<=CONFIG.PRICE_MAX&&m.volume>=CONFIG.MIN_VOLUME&&m.liquidity>=CONFIG.MIN_LIQ);
+
+  for(const m of filtered){
+    const prev=state.marketMemory[m.slug];
+    for(const k of Object.keys(BOTS)){
+      const bot=state.bots[k];
+      for(const t of [...bot.openTrades]) if(t.slug===m.slug){manage(bot,t,m.price);closes++;}
+      if(bot.paused||bot.openTrades.length>=CONFIG.MAX_OPEN_TRADES||bot.openTrades.some(x=>x.slug===m.slug))continue;
+      const s=score(m,prev);
+      if(s>=BOTS[k].MIN_SCORE){if(openTrade(bot,k,m,s))opens++;else dupes++;}
     }
-  }
-}
-
-function saveState() {
-  fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
-}
-
-function extractPrice(m) {
-  try {
-    const raw = JSON.parse(m.outcomePrices || "[]");
-
-    const prices = raw
-      .map(Number)
-      .filter(p => p > 0 && p < 1);
-
-    if (!prices.length) return Number(m.lastPrice) || 0;
-
-    return prices.reduce((a, b) =>
-      Math.abs(b - 0.5) < Math.abs(a - 0.5) ? b : a
-    );
-  } catch {
-    return Number(m.lastPrice) || 0;
-  }
-}
-
-async function getMarkets() {
-  const res = await fetch(
-    "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=30"
-  );
-
-  const data = await res.json();
-
-  return data.map(m => ({
-    slug: m.slug,
-    price: extractPrice(m),
-    volume: Number(m.volume24hr) || 0,
-    liquidity: Number(m.liquidity) || 0,
-  }));
-}
-
-function score(m, hist) {
-  if (!hist || hist.length < 4) return 0;
-
-  const moves = [];
-
-  for (let i = 1; i < hist.length; i++) {
-    moves.push(
-      (hist[i].price - hist[i - 1].price) /
-        hist[i - 1].price
-    );
+    state.marketMemory[m.slug]={price:m.price,volume:m.volume,timestamp:Date.now()};
   }
 
-  const avgMove =
-    moves.reduce((a, b) => a + b, 0) /
-    moves.length;
-
-  const consistency =
-    moves.filter(x => x > 0).length /
-    moves.length;
-
-  const volRatio =
-    hist.at(-2).volume > 0
-      ? m.volume / hist.at(-2).volume
-      : 1;
-
-  const dist = Math.abs(m.price - 0.5);
-
-  let s = 0;
-
-  if (avgMove > 0.003) s += 0.35;
-  if (consistency > 0.75) s += 0.25;
-  if (volRatio > 1.3) s += 0.20;
-  if (dist < 0.12) s += 0.20;
-  if (dist > 0.18) s -= 0.30;
-
-  return Math.max(0, Math.min(1, s));
-}
-
-function equity(bot, markets) {
-  let eq = bot.cash;
-
-  for (const t of bot.openTrades) {
-    const m = markets.find(x => x.slug === t.slug);
-    if (m) eq += t.shares * m.price;
+  for(const k of Object.keys(BOTS)){
+    const b=state.bots[k];
+    const eq=equity(b,mkts);
+    if(eq>b.peakEquity)b.peakEquity=eq;
+    if((b.peakEquity-eq)/b.peakEquity>CONFIG.DRAWDOWN_LIMIT)b.paused=true;
+    log(`${k} cash:${b.cash.toFixed(2)} eq:${eq.toFixed(2)} trades:${b.closedTrades.length}`);
   }
 
-  return eq;
-}
-
-function openTrade(bot, m) {
-  const cost = bot.cash * CONFIG.RISK_PER_TRADE;
-  const fee = cost * CONFIG.FEES;
-
-  if (bot.cash < cost + fee) return;
-
-  bot.cash -= cost + fee;
-
-  bot.openTrades.push({
-    slug: m.slug,
-    entry: m.price,
-    costBasis: cost,
-    shares: cost / m.price,
-    peak: m.price,
-    openedAt: ts(),
-  });
-
-  log(`OPEN ${m.slug}`);
-}
-
-function closeTrade(bot, t, price, reason) {
-  const gross = t.shares * price;
-  const fee = gross * CONFIG.FEES;
-  const net = gross - fee;
-
-  const pnl = net - t.costBasis;
-
-  bot.cash += net;
-
-  bot.closedTrades.push({
-    ...t,
-    exit: price,
-    pnl,
-    reason,
-    closedAt: ts(),
-  });
-
-  bot.openTrades =
-    bot.openTrades.filter(x => x !== t);
-
-  bot.consecutiveLosses =
-    pnl < 0
-      ? bot.consecutiveLosses + 1
-      : 0;
-
-  if (
-    bot.consecutiveLosses >=
-    CONFIG.MAX_CONSECUTIVE_LOSSES
-  ) {
-    bot.paused = true;
-  }
-}
-
-function manage(bot, t, price) {
-  const move = (price - t.entry) / t.entry;
-
-  if (price > t.peak) t.peak = price;
-
-  const trail =
-    (t.peak - price) / t.peak;
-
-  const age =
-    (Date.now() - new Date(t.openedAt)) /
-    86400000;
-
-  if (move <= -CONFIG.STOP_LOSS)
-    return closeTrade(bot, t, price, "SL");
-
-  if (move >= CONFIG.TAKE_PROFIT)
-    return closeTrade(bot, t, price, "TP");
-
-  if (move > 0.04 && trail >= CONFIG.TRAILING_STOP)
-    return closeTrade(bot, t, price, "TRAIL");
-
-  if (age > CONFIG.MAX_HOLD_DAYS)
-    return closeTrade(bot, t, price, "TIME");
-}
-
-async function run() {
-  const markets = await getMarkets();
-
-  for (const m of markets) {
-    if (!state.marketMemory[m.slug])
-      state.marketMemory[m.slug] = [];
-
-    state.marketMemory[m.slug].push({
-      price: m.price,
-      volume: m.volume,
-    });
-
-    if (state.marketMemory[m.slug].length > 6)
-      state.marketMemory[m.slug].shift();
-  }
-
-  for (const m of markets) {
-    for (const key of Object.keys(BOTS)) {
-      const bot = state.bots[key];
-
-      for (const t of [...bot.openTrades]) {
-        if (t.slug === m.slug)
-          manage(bot, t, m.price);
-      }
-
-      if (bot.paused) continue;
-
-      if (
-        bot.openTrades.length >=
-        CONFIG.MAX_OPEN_TRADES
-      )
-        continue;
-
-      const s = score(
-        m,
-        state.marketMemory[m.slug]
-      );
-
-      if (s >= BOTS[key].MIN_SCORE)
-        openTrade(bot, m);
-    }
-  }
-
-  for (const key of Object.keys(BOTS)) {
-    const bot = state.bots[key];
-
-    const eq = equity(bot, markets);
-
-    if (eq > bot.peakEquity)
-      bot.peakEquity = eq;
-
-    const dd =
-      (bot.peakEquity - eq) /
-      bot.peakEquity;
-
-    if (dd > CONFIG.DRAWDOWN_LIMIT)
-      bot.paused = true;
-
-    log(
-      `${key} eq=${eq.toFixed(2)} dd=${(
-        dd * 100
-      ).toFixed(1)}%`
-    );
-  }
-
+  log(`SUMMARY opens=${opens} closes=${closes} dupes=${dupes}`);
   saveState();
-
-  setTimeout(run, CONFIG.INTERVAL);
+  setTimeout(run,CONFIG.INTERVAL);
 }
 
 loadState();
