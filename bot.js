@@ -1,162 +1,431 @@
-import fetch from "node-fetch";
-import fs from "fs";
 
-const INSTANCE_ID = `${process.pid}-${Date.now()}`;
+import fs from "fs";
+import fetch from "node-fetch";
+
+const INSTANCE_ID = process.env.INSTANCE_ID || "main";
 const STATE_FILE = `state.${INSTANCE_ID}.json`;
 
 const CONFIG = {
   INITIAL_CAPITAL: 200,
+
   RISK_PER_TRADE: 0.02,
-  MAX_OPEN_TRADES: 3,
+  FEES: 0.02,
+
+  INTERVAL: 5 * 60 * 1000,
+
+  MAX_OPEN_TRADES: 2,
   MAX_POSITIONS_PER_MARKET: 1,
+
   PRICE_MIN: 0.30,
   PRICE_MAX: 0.70,
-  MIN_VOLUME: 300000,
-  MIN_LIQ: 100000,
-  FEES: 0.02,
-  INTERVAL: 5 * 60 * 1000,
+
+  MIN_VOLUME: 120000,
+  MIN_LIQ: 40000,
+
+  STOP_LOSS: 0.07,
+  TAKE_PROFIT: 0.10,
+
   MAX_CONSECUTIVE_LOSSES: 3,
-  DRAWDOWN_LIMIT: 0.15,
-  STOP_LOSS: 0.03,
-  TAKE_PROFIT: 0.05,
-  MAX_HOLD_HOURS: 24,
+  DRAWDOWN_LIMIT: 0.15
 };
 
 const BOTS = {
-  A: { MIN_SCORE: 0.20 },
-  B: { MIN_SCORE: 0.25 },
-  C: { MIN_SCORE: 0.30 },
+  A: { MIN_SCORE: 0.15 },
+  B: { MIN_SCORE: 0.20 },
+  C: { MIN_SCORE: 0.25 }
 };
 
-let state = { bots: {}, marketMemory: {} };
+let state = {
+  bots: {},
+  marketMemory: {}
+};
 
-const ts = () => new Date().toISOString();
-const log = m => console.log(`[${INSTANCE_ID}] [${ts()}] ${m}`);
-
-function initBot() {
+function freshBot() {
   return {
     cash: CONFIG.INITIAL_CAPITAL,
     openTrades: [],
     closedTrades: [],
+    paused: false,
     consecutiveLosses: 0,
     peakEquity: CONFIG.INITIAL_CAPITAL,
-    paused: false,
+    stats: {}
   };
 }
 
-for (const k of Object.keys(BOTS)) state.bots[k] = initBot();
+for (const k of Object.keys(BOTS)) {
+  state.bots[k] = freshBot();
+}
+
+function ts() {
+  return new Date().toISOString();
+}
+
+function log(m) {
+  console.log(`[${INSTANCE_ID}] ${ts()} ${m}`);
+}
 
 function loadState() {
   try {
     state = JSON.parse(fs.readFileSync(STATE_FILE));
-    for (const k of Object.keys(BOTS)) state.bots[k] ??= initBot();
-    log("STATE LOADED");
-  } catch { log("NEW STATE"); }
-}
 
-const saveState = () => fs.writeFileSync(STATE_FILE, JSON.stringify(state,null,2));
-
-function extractPrice(m){
-  try{
-    const p=JSON.parse(m.outcomePrices||'[]').map(Number).filter(x=>x>0&&x<1);
-    return p[0]||Number(m.lastPrice)||0;
-  }catch{return Number(m.lastPrice)||0}
-}
-
-async function getMarkets(){
-  const r=await fetch("https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=30");
-  const d=await r.json();
-  return d.map(m=>({slug:m.slug,price:extractPrice(m),volume:+m.volume24hr||0,liquidity:+m.liquidity||0}));
-}
-
-function score(m,p){
-  if(!p||!p.timestamp||p.price<=0)return 0;
-  if(Date.now()-p.timestamp>2*CONFIG.INTERVAL)return 0;
-  const move=(m.price-p.price)/p.price;
-  const vol=p.volume>0?m.volume/p.volume:1;
-  const dist=Math.abs(m.price-.5);
-  let s=0;
-  if(move>0&&m.price<.65)s+=.25;
-  if(vol>1.5)s+=.25;
-  if(move>.005&&move<=.05)s+=.30;
-  if(dist>.15)s-=.25;
-  if(move>.07)s-=.15;
-  return Math.max(0,Math.min(1,s));
-}
-
-function equity(bot,markets){
-  let e=bot.cash;
-  for(const t of bot.openTrades){
-    const m=markets.find(x=>x.slug===t.slug);
-    if(m)e+=t.shares*m.price;
-  }
-  return e;
-}
-
-function duplicate(slug){
-  return Object.values(state.bots).flatMap(b=>b.openTrades).find(t=>t.slug===slug);
-}
-
-function openTrade(bot,key,m,s){
-  if(duplicate(m.slug)){log(`DUPLICATE BLOCKED ${m.slug}`);return false;}
-  const size=bot.cash*CONFIG.RISK_PER_TRADE;
-  const fee=size*CONFIG.FEES;
-  if(bot.cash<size+fee)return false;
-  bot.cash-=size+fee;
-  bot.openTrades.push({slug:m.slug,entry:m.price,costBasis:size,shares:size/m.price,openedAt:ts(),score:s,bot:key,instance:INSTANCE_ID});
-  log(`OPEN ${key} ${m.slug} @${m.price.toFixed(3)} score:${s.toFixed(2)}`);
-  return true;
-}
-
-function closeTrade(bot,t,price,reason){
-  const value=t.shares*price;
-  const fee=value*CONFIG.FEES;
-  const net=value-fee;
-  const pnl=net-t.costBasis;
-  bot.cash+=net;
-  bot.closedTrades.push({...t,exit:price,pnl,reason,closedAt:ts(),durationHours:(Date.now()-new Date(t.openedAt))/3600000});
-  bot.openTrades=bot.openTrades.filter(x=>x!==t);
-  bot.consecutiveLosses=pnl<0?bot.consecutiveLosses+1:0;
-  if(bot.consecutiveLosses>=CONFIG.MAX_CONSECUTIVE_LOSSES)bot.paused=true;
-  log(`CLOSE ${reason} pnl:${pnl.toFixed(2)}`);
-}
-
-function manage(bot,t,p){
-  const move=(p-t.entry)/t.entry;
-  const age=(Date.now()-new Date(t.openedAt))/3600000;
-  if(age>CONFIG.MAX_HOLD_HOURS)return closeTrade(bot,t,p,'TIMEOUT');
-  if(move<=-CONFIG.STOP_LOSS)return closeTrade(bot,t,p,'SL');
-  if(move>=CONFIG.TAKE_PROFIT)return closeTrade(bot,t,p,'TP');
-}
-
-async function run(){
-  let opens=0,closes=0,dupes=0;
-  const mkts=await getMarkets();
-  const filtered=mkts.filter(m=>m.price>=CONFIG.PRICE_MIN&&m.price<=CONFIG.PRICE_MAX&&m.volume>=CONFIG.MIN_VOLUME&&m.liquidity>=CONFIG.MIN_LIQ);
-
-  for(const m of filtered){
-    const prev=state.marketMemory[m.slug];
-    for(const k of Object.keys(BOTS)){
-      const bot=state.bots[k];
-      for(const t of [...bot.openTrades]) if(t.slug===m.slug){manage(bot,t,m.price);closes++;}
-      if(bot.paused||bot.openTrades.length>=CONFIG.MAX_OPEN_TRADES||bot.openTrades.some(x=>x.slug===m.slug))continue;
-      const s=score(m,prev);
-      if(s>=BOTS[k].MIN_SCORE){if(openTrade(bot,k,m,s))opens++;else dupes++;}
+    for (const k of Object.keys(BOTS)) {
+      if (!state.bots[k]) state.bots[k] = freshBot();
     }
-    state.marketMemory[m.slug]={price:m.price,volume:m.volume,timestamp:Date.now()};
+
+    cleanGhostTrades();
+
+    log("STATE LOADED");
+  } catch {
+    log("NEW STATE");
+  }
+}
+
+function saveState() {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+function cleanGhostTrades() {
+  for (const bot of Object.values(state.bots)) {
+    const seen = new Set();
+
+    bot.openTrades = bot.openTrades.filter(t => {
+      if (!t.slug || !t.entry || !t.shares) return false;
+
+      const id = `${t.slug}_${t.entry}_${t.shares}`;
+
+      if (seen.has(id)) return false;
+
+      seen.add(id);
+      return true;
+    });
+  }
+}
+
+function extractPrice(m) {
+  try {
+    const raw = JSON.parse(m.outcomePrices || "[]");
+
+    const valid = raw
+      .map(Number)
+      .filter(x => !isNaN(x) && x > 0 && x < 1);
+
+    if (valid.length) return valid[0];
+  } catch {}
+
+  return Number(m.lastPrice) || 0;
+}
+
+async function getMarkets() {
+  const r = await fetch(
+    "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=30"
+  );
+
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+
+  const d = await r.json();
+
+  return d.map(m => ({
+    slug: m.slug,
+    price: extractPrice(m),
+    volume: +m.volume24hr || 0,
+    liquidity: +m.liquidity || 0
+  }));
+}
+
+function score(m, p) {
+  if (!p || p.price <= 0) return 0;
+
+  const age = Date.now() - p.timestamp;
+
+  if (age > 4 * CONFIG.INTERVAL) return 0;
+
+  const move = (m.price - p.price) / p.price;
+  const vol = p.volume > 0 ? m.volume / p.volume : 1;
+  const dist = Math.abs(m.price - 0.5);
+
+  let s = 0;
+
+  if (move > 0.002 && move <= 0.05) s += 0.35;
+  if (vol > 1.15) s += 0.20;
+  if (move > 0 && m.price < 0.70) s += 0.15;
+  if (dist > 0.20) s -= 0.15;
+  if (move > 0.08) s -= 0.10;
+
+  return Math.max(0, Math.min(1, s));
+}
+
+function marketPositions(slug) {
+  let count = 0;
+
+  for (const bot of Object.values(state.bots)) {
+    count += bot.openTrades.filter(t => t.slug === slug).length;
   }
 
-  for(const k of Object.keys(BOTS)){
-    const b=state.bots[k];
-    const eq=equity(b,mkts);
-    if(eq>b.peakEquity)b.peakEquity=eq;
-    if((b.peakEquity-eq)/b.peakEquity>CONFIG.DRAWDOWN_LIMIT)b.paused=true;
-    log(`${k} cash:${b.cash.toFixed(2)} eq:${eq.toFixed(2)} trades:${b.closedTrades.length}`);
+  return count;
+}
+
+function equity(bot, markets) {
+  let eq = bot.cash;
+
+  for (const t of bot.openTrades) {
+    const m = markets.find(x => x.slug === t.slug);
+
+    if (m) eq += t.shares * m.price;
   }
 
-  log(`SUMMARY opens=${opens} closes=${closes} dupes=${dupes}`);
-  saveState();
-  setTimeout(run,CONFIG.INTERVAL);
+  return eq;
+}
+
+function updateStats(bot) {
+  const t = bot.closedTrades;
+
+  if (!t.length) return;
+
+  const wins = t.filter(x => x.pnl > 0);
+  const losses = t.filter(x => x.pnl <= 0);
+
+  const avgWin =
+    wins.reduce((a, b) => a + b.pnl, 0) /
+    (wins.length || 1);
+
+  const avgLoss =
+    Math.abs(
+      losses.reduce((a, b) => a + b.pnl, 0)
+    ) / (losses.length || 1);
+
+  const wr = wins.length / t.length;
+
+  const expectancy =
+    wr * avgWin -
+    (1 - wr) * avgLoss;
+
+  const pf =
+    avgLoss > 0
+      ? (wr * avgWin) /
+        ((1 - wr) * avgLoss)
+      : Infinity;
+
+  const breakevenWR =
+    avgWin + avgLoss > 0
+      ? avgLoss / (avgWin + avgLoss)
+      : 0;
+
+  bot.stats = {
+    trades: t.length,
+    avgWin,
+    avgLoss,
+    winrate: wr,
+    expectancy,
+    profitFactor: pf,
+    breakevenWR
+  };
+}
+
+function openTrade(bot, m, s) {
+  const size = bot.cash * CONFIG.RISK_PER_TRADE;
+  const fee = size * CONFIG.FEES;
+  const total = size + fee;
+
+  if (bot.cash < total) return;
+
+  bot.cash -= total;
+
+  bot.openTrades.push({
+    slug: m.slug,
+    entry: m.price,
+    costBasis: size,
+    shares: size / m.price,
+    openedAt: ts()
+  });
+
+  log(`OPEN ${m.slug} score=${s.toFixed(2)}`);
+}
+
+function closeTrade(bot, t, price, reason) {
+  const gross = t.shares * price;
+  const fee = gross * CONFIG.FEES;
+
+  const net = gross - fee;
+  const pnl = net - t.costBasis;
+
+  bot.cash += net;
+
+  bot.closedTrades.push({
+    ...t,
+    exit: price,
+    pnl,
+    reason,
+    closedAt: ts()
+  });
+
+  bot.openTrades =
+    bot.openTrades.filter(x => x !== t);
+
+  bot.consecutiveLosses =
+    pnl < 0
+      ? bot.consecutiveLosses + 1
+      : 0;
+
+  if (
+    bot.consecutiveLosses >=
+    CONFIG.MAX_CONSECUTIVE_LOSSES
+  ) {
+    bot.paused = true;
+  }
+
+  updateStats(bot);
+
+  log(`CLOSE ${reason} pnl=${pnl.toFixed(2)}`);
+}
+
+function manage(bot, t, price) {
+  const move =
+    (price - t.entry) / t.entry;
+
+  if (move <= -CONFIG.STOP_LOSS)
+    return closeTrade(bot, t, price, "SL");
+
+  if (move >= CONFIG.TAKE_PROFIT)
+    return closeTrade(bot, t, price, "TP");
+}
+
+async function run() {
+  try {
+    const markets = await getMarkets();
+
+    let rejects = {
+      price: 0,
+      volume: 0,
+      liq: 0
+    };
+
+    const filtered = markets.filter(m => {
+      if (
+        m.price < CONFIG.PRICE_MIN ||
+        m.price > CONFIG.PRICE_MAX
+      ) {
+        rejects.price++;
+        return false;
+      }
+
+      if (m.volume < CONFIG.MIN_VOLUME) {
+        rejects.volume++;
+        return false;
+      }
+
+      if (
+        m.liquidity < CONFIG.MIN_LIQ
+      ) {
+        rejects.liq++;
+        return false;
+      }
+
+      return true;
+    });
+
+    let opens = 0;
+
+    for (const m of filtered) {
+      const prev =
+        state.marketMemory[m.slug];
+
+      for (const k of Object.keys(BOTS)) {
+        const bot =
+          state.bots[k];
+
+        for (const t of [
+          ...bot.openTrades
+        ]) {
+          if (t.slug === m.slug)
+            manage(bot, t, m.price);
+        }
+
+        if (bot.paused) continue;
+
+        if (
+          bot.openTrades.length >=
+          CONFIG.MAX_OPEN_TRADES
+        )
+          continue;
+
+        if (
+          marketPositions(m.slug) >=
+          CONFIG.MAX_POSITIONS_PER_MARKET
+        )
+          continue;
+
+        const s =
+          score(m, prev);
+
+        if (
+          s <
+          BOTS[k].MIN_SCORE
+        )
+          continue;
+
+        openTrade(bot, m, s);
+        opens++;
+      }
+
+      state.marketMemory[m.slug] = {
+        price: m.price,
+        volume: m.volume,
+        timestamp: Date.now()
+      };
+    }
+
+    for (const k of Object.keys(BOTS)) {
+      const bot =
+        state.bots[k];
+
+      const eq =
+        equity(bot, markets);
+
+      if (
+        eq > bot.peakEquity
+      )
+        bot.peakEquity = eq;
+
+      const dd =
+        (bot.peakEquity - eq) /
+        bot.peakEquity;
+
+      if (
+        dd >
+        CONFIG.DRAWDOWN_LIMIT
+      )
+        bot.paused = true;
+
+      log(
+        `${k} cash=${bot.cash.toFixed(
+          2
+        )} eq=${eq.toFixed(
+          2
+        )} trades=${
+          bot.closedTrades.length
+        }`
+      );
+    }
+
+    const pfA =
+      state.bots.A.stats
+        .profitFactor
+        ?.toFixed(2) ||
+      "N/A";
+
+    log(
+      `CYCLE markets=${markets.length} filtered=${filtered.length} opens=${opens} rej[p:${rejects.price}|v:${rejects.volume}|l:${rejects.liq}] PF_A=${pfA}`
+    );
+
+    saveState();
+  } catch (e) {
+    log(`ERR ${e.message}`);
+  }
+
+  setTimeout(
+    run,
+    CONFIG.INTERVAL
+  );
 }
 
 loadState();
