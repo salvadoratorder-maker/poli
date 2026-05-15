@@ -1,35 +1,32 @@
+// ========================================
+// POLYMARKET PAPER TRADING BOT
+// Versión final - listo para Railway
+// ========================================
 
 import fs from "fs";
 import fetch from "node-fetch";
 
 const CONFIG = {
   API: "https://gamma-api.polymarket.com",
-
   INITIAL_EQUITY: 200,
-
-  PRICE_MIN: 0.18,
-  PRICE_MAX: 0.82,
-
-  MIN_VOLUME: 50000,
-  MIN_LIQ: 25000,
-
-  RISK_PER_TRADE: 0.02,
-  FEES: 0.02,
-
+  
+  // Filtros más realistas
+  PRICE_MIN: 0.20,
+  PRICE_MAX: 0.80,
+  MIN_VOLUME: 30000,
+  MIN_LIQ: 10000,
+  
+  RISK_PER_TRADE: 0.02,  // 2% por trade
   MAX_OPEN_TRADES: 2,
   MAX_POSITIONS_PER_MARKET: 1,
-
+  
   HOLD_TIME: 60 * 60 * 1000,
-  CYCLE_INTERVAL: 5 * 60 * 1000,
-
-  STOP_LOSS: 0.15,
-  TAKE_PROFIT: 0.30,
-};
-
-const BOTS = {
-  A: { MIN_SCORE: 0.10 },
-  B: { MIN_SCORE: 0.14 },
-  C: { MIN_SCORE: 0.18 }
+  CYCLE_INTERVAL: 10 * 60 * 1000,  // 10 minutos
+  
+  STOP_LOSS: 0.15,  // 15% de stop loss
+  TAKE_PROFIT: 0.30, // 30% de take profit
+  
+  FEES: 0.005, // 0.5% de comision (más realista)
 };
 
 const STATE_FILE = "./state.json";
@@ -65,7 +62,7 @@ function log(msg) {
 async function fetchMarkets() {
   try {
     const r = await fetch(
-      `${CONFIG.API}/markets?active=true&closed=false&limit=100`
+      `${CONFIG.API}/markets?active=true&closed=false&limit=50`
     );
 
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -115,20 +112,26 @@ function updateMemory(markets) {
 
 function score(m) {
   const mv = move(m.slug, m.price);
-
+  
+  // Normalizar volumen
   const volNorm = Math.min(1, m.volume / 500000);
+  
+  // Distancia al centro (0.5) - penaliza extremos
   const dist = Math.abs(m.price - 0.5);
-
+  
   let s = 0;
 
-  if (mv > 0.001) s += 0.35;
-  else if (mv > 0.0003) s += 0.20;
-  else if (mv < -0.001) s += 0.35;
-  else if (mv < -0.0003) s += 0.20;
-
-  s += volNorm * 0.25;
-  s += (1 - dist * 2) * 0.15;
-
+  // Momentum (solo positivo para esta estrategia)
+  if (mv > 0.001) s += 0.40;
+  else if (mv > 0.0003) s += 0.25;
+  
+  // Volumen
+  s += volNorm * 0.35;
+  
+  // Posición central (preferir medias)
+  s += (1 - dist * 2) * 0.25;
+  
+  // Penalizar extremos
   if (dist > 0.35) s -= 0.20;
 
   return Math.max(0, Math.min(1, s));
@@ -189,15 +192,12 @@ function open(bot, m) {
     opened: Date.now()
   });
 
-  log(`OPEN ${bot} ${m.slug} ${m.price.toFixed(3)}`);
+  log(`OPEN ${bot} ${m.slug} @ ${m.price.toFixed(3)}`);
 }
 
 function close(pos, px) {
-  const grossPnl =
-    pos.invested * ((px - pos.entry) / pos.entry);
-
-  const netPnl =
-    grossPnl - (pos.invested * CONFIG.FEES);
+  const grossPnl = pos.invested * ((px - pos.entry) / pos.entry);
+  const netPnl = grossPnl - (grossPnl * CONFIG.FEES);
 
   state.equity[pos.bot] += netPnl;
 
@@ -207,12 +207,9 @@ function close(pos, px) {
     pnl: netPnl
   });
 
-  state.positions =
-    state.positions.filter(p => p !== pos);
+  state.positions = state.positions.filter(p => p !== pos);
 
-  log(
-    `CLOSE ${pos.bot} pnl=${netPnl.toFixed(2)}`
-  );
+  log(`CLOSE ${pos.bot} pnl=${netPnl.toFixed(2)}`);
 }
 
 // =====================
@@ -248,25 +245,26 @@ function manage(markets) {
 // REPORT
 // =====================
 
-function report(markets, filtered, rej) {
+function report(filtered, rej) {
   log(
-    `CYCLE ${state.cycle} markets=${markets.length} filtered=${filtered.length} open=${state.positions.length} rej[p:${rej.p}|v:${rej.v}|l:${rej.l}]`
+    `CYCLE ${state.cycle} markets=${filtered.length} open=${state.positions.length} rej[p:${rej.p}|v:${rej.v}|l:${rej.l}]`
   );
 
-  for (const bot of ["A", "B", "C"]) {
-    const pos = state.positions.filter(p => p.bot === bot).length;
-    log(`${bot} eq=${state.equity[bot].toFixed(2)} pos=${pos}`);
+  for (const b of ["A", "B", "C"]) {
+    const pos = state.positions.filter(p => p.bot === b).length;
+    const closed = state.closed.filter(c => c.bot === b).length;
+    log(`${b} eq=${state.equity[b].toFixed(2)} pos=${pos} closed=${closed}`);
   }
 
   const totalTrades = state.closed.length;
   const wins = state.closed.filter(t => t.pnl > 0).length;
   const totalPnl = state.closed.reduce((s, t) => s + t.pnl, 0);
 
-  log(
-    `TOTAL trades=${totalTrades} WR=${
-      totalTrades ? ((wins / totalTrades) * 100).toFixed(1) : "0"
-    }% pnl=${totalPnl.toFixed(2)}`
-  );
+  if (totalTrades > 0) {
+    log(
+      `TOTAL trades=${totalTrades} WR=${((wins / totalTrades) * 100).toFixed(1)}% pnl=${totalPnl.toFixed(2)}`
+    );
+  }
 }
 
 // =====================
@@ -277,38 +275,37 @@ async function cycle() {
   state.cycle++;
 
   const markets = await fetchMarkets();
+  
+  // Asegurarnos que no tenemos mercado que esté resuelto
+  const validMarkets = markets.filter(m => 
+    m.price > 0.01 && m.price < 0.99 // evitar mercados resueltos
+  );
 
-  const { out: filtered, rej } = filter(markets);
+  const { out: filtered, rej } = filter(validMarkets);
+  manage(validMarkets);
 
-  manage(markets);
-
-  const scoredMarkets = filtered.map(m => ({
-    ...m,
-    score: score(m)
-  }));
-
+  // Seleccionar mejores oportunidades por bot
   for (const bot of ["A", "B", "C"]) {
-    const candidate = scoredMarkets
-      .filter(m => m.score >= BOTS[bot].MIN_SCORE)
-      .sort((a, b) => b.score - a.score)[0];
+    // Encontrar oportunidades con score alto
+    const scoredMarkets = filtered.map(m => ({ 
+      ...m, 
+      score: score(m) 
+    }))
+    .filter(m => m.score >= 0.25)
+    .sort((a, b) => b.score - a.score);
 
-    if (candidate) {
-      open(bot, candidate);
+    if (scoredMarkets[0]) {
+      open(bot, scoredMarkets[0]);
     }
   }
 
-  report(markets, filtered, rej);
-
-  updateMemory(markets);
-
+  report(filtered, rej);
+  updateMemory(validMarkets);
   saveState();
 
   setTimeout(cycle, CONFIG.CYCLE_INTERVAL);
 }
 
-// =====================
-// START
-// =====================
+log("POLYMARKET PAPER TRADING BOT v2 START - Ready for Railway");
 
-log("MICRODRIFT v4.2 START");
 cycle();
