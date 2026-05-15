@@ -1,6 +1,6 @@
 // ========================================
-// POLYMARKET MICRODRIFT v4.2
-// Paper trading / multi-bot / persistent
+// POLYMARKET MICRODRIFT v4.3
+// Enhanced Paper Trading / Multi-Bot / Persistent
 // ========================================
 
 import fs from "fs";
@@ -30,9 +30,9 @@ const CONFIG = {
 };
 
 const BOTS = {
-  A: { MIN_SCORE: 0.10 },
-  B: { MIN_SCORE: 0.14 },
-  C: { MIN_SCORE: 0.12 }  // ajustado para operar
+  A: { MIN_SCORE: 0.10, BALANCE: 200 },
+  B: { MIN_SCORE: 0.14, BALANCE: 200 },
+  C: { MIN_SCORE: 0.12, BALANCE: 200 }
 };
 
 const STATE_FILE = "./state.json";
@@ -41,14 +41,15 @@ let state = loadState();
 
 function loadState() {
   try {
-    return JSON.parse(fs.readFileSync(STATE_FILE));
+    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
   } catch {
     return {
       cycle: 0,
       memory: {},
       positions: [],
       closed: [],
-      equity: { A: 200, B: 200, C: 200 }
+      equity: { A: 200, B: 200, C: 200 },
+      lastUpdateTime: Date.now()
     };
   }
 }
@@ -67,31 +68,43 @@ function log(msg) {
 
 async function fetchMarkets() {
   try {
-    const r = await fetch(
-      `${CONFIG.API}/markets?active=true&closed=false&limit=100`
+    const response = await fetch(
+      `${CONFIG.API}/markets?active=true&closed=false&limit=100`,
+      { 
+        headers: {
+          "User-Agent": "Microdrift-Bot/4.3"
+        }
+      }
     );
 
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
 
-    const d = await r.json();
-
-    return d.map(m => ({
+    const data = await response.json();
+    
+    return data.map(m => ({
       slug: m.slug,
       price: extractPrice(m),
       volume: Number(m.volume24hr || 0),
-      liquidity: Number(m.liquidity || 0)
+      liquidity: Number(m.liquidity || 0),
+      lastPrice: Number(m.lastPrice || 0.5),
+      outcomes: m.outcomes || []
     }));
-  } catch (e) {
-    log(`FETCH ERROR ${e.message}`);
+  } catch (error) {
+    log(`FETCH ERROR: ${error.message}`);
     return [];
   }
 }
 
 function extractPrice(m) {
   try {
-    const p = JSON.parse(m.outcomePrices || "[]");
-    return Number(p[0] || m.lastPrice || 0.5);
-  } catch {
+    if (m.outcomePrices && m.outcomePrices.length > 0) {
+      const priceArray = JSON.parse(m.outcomePrices);
+      return Number(priceArray[0] || 0.5);
+    }
+    return Number(m.lastPrice || 0.5);
+  } catch (e) {
     return Number(m.lastPrice || 0.5);
   }
 }
@@ -121,22 +134,34 @@ function updateMemory(markets) {
 
 function score(m) {
   const mv = move(m.slug, m.price);
-
-  const volNorm = Math.min(1, m.volume / 500000);
-  const dist = Math.abs(m.price - 0.5);
-
+  
+  // Enhanced scoring algorithm
   let s = 0;
-
-  if (mv > 0.001) s += 0.35;
-  else if (mv > 0.0003) s += 0.20;
-  else if (mv < -0.001) s += 0.35;
-  else if (mv < -0.0003) s += 0.20;
-
-  s += volNorm * 0.25;
-  s += (1 - dist * 2) * 0.15;
-
-  if (dist > 0.35) s -= 0.20;
-
+  
+  // Price movement signal (more weight to significant moves)
+  if (Math.abs(mv) > 0.005) {
+    s += Math.min(0.5, Math.abs(mv) * 100);
+  } else if (Math.abs(mv) > 0.001) {
+    s += Math.min(0.3, Math.abs(mv) * 50);
+  }
+  
+  // Volume normalization
+  const volNorm = Math.min(1, m.volume / 500000);
+  s += volNorm * 0.3;
+  
+  // Distance from center (0.5) - penalize extreme prices
+  const dist = Math.abs(m.price - 0.5);
+  s += (1 - dist * 2) * 0.2;
+  
+  // Penalize extreme prices
+  if (dist > 0.35) {
+    s -= 0.2;
+  }
+  
+  // Add liquidity factor
+  const liqNorm = Math.min(1, m.liquidity / 100000);
+  s += liqNorm * 0.15;
+  
   return Math.max(0, Math.min(1, s));
 }
 
@@ -146,33 +171,34 @@ function score(m) {
 
 function filter(markets) {
   let rej = { p: 0, v: 0, l: 0 };
+  let validMarkets = [];
 
-  const out = markets.filter(m => {
-    // Filtro para evitar mercados resueltos o extranos
+  for (const m of markets) {
+    // Filtro para evitar mercados resueltos o extraños
     if (m.price <= 0.001 || m.price >= 0.999) {
       rej.p++;
-      return false;
+      continue;
     }
 
     if (m.price < CONFIG.PRICE_MIN || m.price > CONFIG.PRICE_MAX) {
       rej.p++;
-      return false;
+      continue;
     }
 
     if (m.volume < CONFIG.MIN_VOLUME) {
       rej.v++;
-      return false;
+      continue;
     }
 
     if (m.liquidity < CONFIG.MIN_LIQ) {
       rej.l++;
-      return false;
+      continue;
     }
 
-    return true;
-  });
+    validMarkets.push(m);
+  }
 
-  return { out, rej };
+  return { out: validMarkets, rej };
 }
 
 // =====================
@@ -193,12 +219,19 @@ function open(bot, m) {
 
   const invested = state.equity[bot] * CONFIG.RISK_PER_TRADE;
 
+  // Check if we have enough funds
+  if (invested <= 0) {
+    log(`NOT ENOUGH FUNDS FOR ${bot} to open position`);
+    return;
+  }
+
   state.positions.push({
     bot,
     slug: m.slug,
     entry: m.price,
     invested,
-    opened: Date.now()
+    opened: Date.now(),
+    lastUpdate: Date.now()
   });
 
   log(`OPEN ${bot} ${m.slug} ${m.price.toFixed(3)} score=${score(m).toFixed(2)}`);
@@ -213,7 +246,8 @@ function close(pos, px) {
   state.closed.push({
     ...pos,
     exit: px,
-    pnl: netPnl
+    pnl: netPnl,
+    closeTime: Date.now()
   });
 
   state.positions = state.positions.filter(p => p !== pos);
@@ -232,6 +266,9 @@ function manage(markets) {
     const m = markets.find(x => x.slug === p.slug);
     if (!m) continue;
 
+    // Update lastUpdate time for tracking
+    p.lastUpdate = now;
+    
     const roi = (m.price - p.entry) / p.entry;
 
     if (roi <= -CONFIG.STOP_LOSS) {
@@ -246,6 +283,7 @@ function manage(markets) {
 
     if (now - p.opened > CONFIG.HOLD_TIME) {
       close(p, m.price);
+      continue;
     }
   }
 }
@@ -284,39 +322,72 @@ function report(totalMarkets, filtered, rej) {
 async function cycle() {
   state.cycle++;
 
-  const markets = await fetchMarkets();
+  const startTime = Date.now();
+  
+  try {
+    const markets = await fetchMarkets();
 
-  const { out: filtered, rej } = filter(markets);
+    const { out: filtered, rej } = filter(markets);
 
-  manage(markets);
+    manage(markets);
 
-  const scoredMarkets = filtered.map(m => ({
-    ...m,
-    score: score(m)
-  }));
+    const scoredMarkets = filtered.map(m => ({
+      ...m,
+      score: score(m)
+    }));
 
-  for (const bot of ["A", "B", "C"]) {
-    const candidate = scoredMarkets
-      .filter(m => m.score >= BOTS[bot].MIN_SCORE)
-      .sort((a, b) => b.score - a.score)[0];
+    // Improved trading logic to ensure better opportunities
+    for (const bot of ["A", "B", "C"]) {
+      // Prioritize by score and available funds
+      const eligibleMarkets = scoredMarkets
+        .filter(m => m.score >= BOTS[bot].MIN_SCORE && 
+                    state.equity[bot] > 0)
+        .sort((a, b) => b.score - a.score);
 
-    if (candidate) {
-      open(bot, candidate);
+      if (eligibleMarkets.length > 0) {
+        const candidate = eligibleMarkets[0];
+        open(bot, candidate);
+      }
     }
+
+    report(markets.length, filtered, rej);
+
+    updateMemory(markets);
+
+    saveState();
+    
+    // Log performance
+    const elapsed = Date.now() - startTime;
+    if (elapsed > CONFIG.CYCLE_INTERVAL) {
+      log(`⚠️ Cycle took ${elapsed}ms (exceeds interval)`);
+    }
+    
+  } catch (error) {
+    log(`CYCLE ERROR: ${error.message}`);
   }
 
-  report(markets.length, filtered, rej);
-
-  updateMemory(markets);
-
-  saveState();
-
-  setTimeout(cycle, CONFIG.CYCLE_INTERVAL);
+  // Ensure interval is maintained even if processing takes time
+  const nextCycleTime = CONFIG.CYCLE_INTERVAL - (Date.now() - startTime);
+  setTimeout(cycle, Math.max(1000, nextCycleTime));
 }
 
 // =====================
 // START
 // =====================
 
-log("🚀 MICRODRIFT v4.2 FINAL - STARTING...");
+log("🚀 MICRODRIFT v4.3 - STARTING...");
+log(`Config: Cycle every ${CONFIG.CYCLE_INTERVAL/1000}s, Max trades: ${CONFIG.MAX_OPEN_TRADES}`);
 cycle();
+
+// Add error handling for uncaught exceptions
+process.on('uncaughtException', (err) => {
+  log(`UNCAUGHT EXCEPTION: ${err.message}`);
+  log(err.stack);
+  saveState();
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  log(`UNHANDLED REJECTION at: ${promise}, reason: ${reason}`);
+  saveState();
+});
