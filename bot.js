@@ -1,5 +1,5 @@
 // ========================================
-// POLYMARKET MICRODRIFT v4.3
+// POLYMARKET MICRODRIFT v4.3 (CORREGIDAS)
 // Enhanced Paper Trading / Multi-Bot / Persistent
 // ========================================
 
@@ -22,17 +22,17 @@ const CONFIG = {
   MAX_OPEN_TRADES: 2,
   MAX_POSITIONS_PER_MARKET: 1,
 
-  HOLD_TIME: 60 * 60 * 1000,
-  CYCLE_INTERVAL: 5 * 60 * 1000,
+  HOLD_TIME: 4 * 60 * 60 * 1000, // 4 horas
+  CYCLE_INTERVAL: 60 * 60 * 1000, // 1 hora
 
   STOP_LOSS: 0.15,
   TAKE_PROFIT: 0.30,
 };
 
 const BOTS = {
-  A: { MIN_SCORE: 0.10, BALANCE: 200 },
-  B: { MIN_SCORE: 0.14, BALANCE: 200 },
-  C: { MIN_SCORE: 0.12, BALANCE: 200 }
+  A: { MIN_SCORE: 0.10 },
+  B: { MIN_SCORE: 0.14 },
+  C: { MIN_SCORE: 0.12 }
 };
 
 const STATE_FILE = "./state.json";
@@ -49,6 +49,8 @@ function loadState() {
       positions: [],
       closed: [],
       equity: { A: 200, B: 200, C: 200 },
+      peak: { A: 200, B: 200, C: 200 },
+      dd: { A: 0, B: 0, C: 0 },
       lastUpdateTime: Date.now()
     };
   }
@@ -99,9 +101,16 @@ async function fetchMarkets() {
 
 function extractPrice(m) {
   try {
-    if (m.outcomePrices && m.outcomePrices.length > 0) {
-      const priceArray = JSON.parse(m.outcomePrices);
-      return Number(priceArray[0] || 0.5);
+    if (Array.isArray(m.outcomePrices)) {
+      const prices = m.outcomePrices.map(Number).filter(p => p > 0 && p < 1);
+      return prices.reduce((a, b) =>
+        Math.abs(b-0.5) < Math.abs(a-0.5) ? b : a, prices[0]);
+    }
+    if (typeof m.outcomePrices === "string") {
+      const arr = JSON.parse(m.outcomePrices);
+      const prices = arr.map(Number).filter(p => p > 0 && p < 1);
+      return prices.reduce((a, b) =>
+        Math.abs(b-0.5) < Math.abs(a-0.5) ? b : a, prices[0]);
     }
     return Number(m.lastPrice || 0.5);
   } catch (e) {
@@ -133,34 +142,32 @@ function updateMemory(markets) {
 // =====================
 
 function score(m) {
-  const mv = move(m.slug, m.price);
+  const mv = Math.abs(move(m.slug, m.price));
+  if (mv < 0.0008) return 0;
   
-  // Enhanced scoring algorithm
   let s = 0;
   
-  // Price movement signal (more weight to significant moves)
-  if (Math.abs(mv) > 0.005) {
-    s += Math.min(0.5, Math.abs(mv) * 100);
-  } else if (Math.abs(mv) > 0.001) {
-    s += Math.min(0.3, Math.abs(mv) * 50);
-  }
+  // Price movement signal (requisito real)
+  if (mv > 0.005) s += 0.45;
+  else if (mv > 0.002) s += 0.30;
+  else s += 0.15;
   
   // Volume normalization
   const volNorm = Math.min(1, m.volume / 500000);
-  s += volNorm * 0.3;
+  s += volNorm * 0.10;
   
   // Distance from center (0.5) - penalize extreme prices
   const dist = Math.abs(m.price - 0.5);
-  s += (1 - dist * 2) * 0.2;
-  
-  // Penalize extreme prices
-  if (dist > 0.35) {
-    s -= 0.2;
-  }
+  s += (1 - dist * 2) * 0.10;
   
   // Add liquidity factor
   const liqNorm = Math.min(1, m.liquidity / 100000);
-  s += liqNorm * 0.15;
+  s += liqNorm * 0.05;
+  
+  // Penalize extreme prices
+  if (dist > 0.35) {
+    s -= 0.15;
+  }
   
   return Math.max(0, Math.min(1, s));
 }
@@ -205,13 +212,12 @@ function filter(markets) {
 // POSITIONS
 // =====================
 
-function duplicate(slug) {
-  return state.positions.filter(p => p.slug === slug).length >=
-    CONFIG.MAX_POSITIONS_PER_MARKET;
+function duplicate(bot, slug) {
+  return state.positions.some(p => p.bot === bot && p.slug === slug);
 }
 
 function open(bot, m) {
-  if (duplicate(m.slug)) return;
+  if (duplicate(bot, m.slug)) return;
 
   const botOpen = state.positions.filter(p => p.bot === bot).length;
 
@@ -225,6 +231,9 @@ function open(bot, m) {
     return;
   }
 
+  // Restar equity al abrir (CORREGIDO)
+  state.equity[bot] -= invested;
+
   state.positions.push({
     bot,
     slug: m.slug,
@@ -234,14 +243,15 @@ function open(bot, m) {
     lastUpdate: Date.now()
   });
 
-  log(`OPEN ${bot} ${m.slug} ${m.price.toFixed(3)} score=${score(m).toFixed(2)}`);
+  log(`OPEN ${bot} ${m.slug} ${m.price.toFixed(3)} score=${m.score.toFixed(2)}`);
 }
 
 function close(pos, px) {
   const grossPnl = pos.invested * ((px - pos.entry) / pos.entry);
   const netPnl = grossPnl - (pos.invested * CONFIG.FEES);
 
-  state.equity[pos.bot] += netPnl;
+  // Devolver principal + PnL al cerrar (CORREGIDO)
+  state.equity[pos.bot] += pos.invested + netPnl;
 
   state.closed.push({
     ...pos,
@@ -285,6 +295,14 @@ function manage(markets) {
       close(p, m.price);
       continue;
     }
+    
+    // Drawdown tracking (CORREGIDO)
+    const mtmEquity = state.equity[p.bot] + (p.invested + (p.invested * roi));
+    state.peak[p.bot] = Math.max(state.peak[p.bot], mtmEquity);
+    state.dd[p.bot] = Math.max(
+      state.dd[p.bot],
+      (state.peak[p.bot] - mtmEquity) / state.peak[p.bot]
+    );
   }
 }
 
@@ -299,7 +317,7 @@ function report(totalMarkets, filtered, rej) {
 
   for (const b of ["A", "B", "C"]) {
     const pos = state.positions.filter(p => p.bot === b).length;
-    log(`${b} eq=${state.equity[b].toFixed(2)} pos=${pos}`);
+    log(`${b} eq=${state.equity[b].toFixed(2)} pos=${pos} DD=${(state.dd[b]*100).toFixed(2)}%`);
   }
 
   const totalTrades = state.closed.length;
@@ -336,17 +354,25 @@ async function cycle() {
       score: score(m)
     }));
 
-    // Improved trading logic to ensure better opportunities
+    // Improved trading logic with progressive exclusion
+    const used = new Set();
+    const openSlugs = new Set(
+      state.positions.map(p => p.slug)
+    );
+    
     for (const bot of ["A", "B", "C"]) {
-      // Prioritize by score and available funds
       const eligibleMarkets = scoredMarkets
-        .filter(m => m.score >= BOTS[bot].MIN_SCORE && 
-                    state.equity[bot] > 0)
+        .filter(m => 
+          !used.has(m.slug) && 
+          !openSlugs.has(m.slug) &&
+          m.score >= BOTS[bot].MIN_SCORE
+        )
         .sort((a, b) => b.score - a.score);
 
       if (eligibleMarkets.length > 0) {
         const candidate = eligibleMarkets[0];
         open(bot, candidate);
+        used.add(candidate.slug);
       }
     }
 
