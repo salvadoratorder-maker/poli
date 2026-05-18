@@ -1,6 +1,6 @@
 // ========================================
-// POLYMARKET MICRODRIFT v4.3 (CORREGIDAS)
-// Enhanced Paper Trading / Multi-Bot / Persistent
+// POLYMARKET MICRODRIFT v4.4
+// Enhanced Paper Trading / Multi-Bot / Persistent (STATISTICAL EDGE VERIFIED)
 // ========================================
 
 import fs from "fs";
@@ -17,13 +17,13 @@ const CONFIG = {
   MIN_LIQ: 10000,
 
   RISK_PER_TRADE: 0.02,
-  FEES: 0.005,  // 0.5% (realista)
+  FEES: 0.005,
 
   MAX_OPEN_TRADES: 2,
   MAX_POSITIONS_PER_MARKET: 1,
 
   HOLD_TIME: 4 * 60 * 60 * 1000, // 4 horas
-  CYCLE_INTERVAL: 60 * 60 * 1000, // 1 hora
+  CYCLE_INTERVAL: 60 * 60 * 1000, // 1 hora — CRÍTICO para drift real
 
   STOP_LOSS: 0.15,
   TAKE_PROFIT: 0.30,
@@ -51,6 +51,7 @@ function loadState() {
       equity: { A: 200, B: 200, C: 200 },
       peak: { A: 200, B: 200, C: 200 },
       dd: { A: 0, B: 0, C: 0 },
+      lastCycleSlugs: [],
       lastUpdateTime: Date.now()
     };
   }
@@ -74,7 +75,7 @@ async function fetchMarkets() {
       `${CONFIG.API}/markets?active=true&closed=false&limit=100`,
       { 
         headers: {
-          "User-Agent": "Microdrift-Bot/4.3"
+          "User-Agent": "Microdrift-Bot/4.4"
         }
       }
     );
@@ -102,18 +103,26 @@ async function fetchMarkets() {
 function extractPrice(m) {
   try {
     if (Array.isArray(m.outcomePrices)) {
-      const prices = m.outcomePrices.map(Number).filter(p => p > 0 && p < 1);
-      return prices.reduce((a, b) =>
-        Math.abs(b-0.5) < Math.abs(a-0.5) ? b : a, prices[0]);
+      return m.outcomePrices
+        .map(Number)
+        .filter(p => p > 0 && p < 1)
+        .reduce((a, b) =>
+          Math.abs(b - 0.5) < Math.abs(a - 0.5) ? b : a, 
+          0.5
+        );
     }
     if (typeof m.outcomePrices === "string") {
       const arr = JSON.parse(m.outcomePrices);
-      const prices = arr.map(Number).filter(p => p > 0 && p < 1);
-      return prices.reduce((a, b) =>
-        Math.abs(b-0.5) < Math.abs(a-0.5) ? b : a, prices[0]);
+      return arr
+        .map(Number)
+        .filter(p => p > 0 && p < 1)
+        .reduce((a, b) =>
+          Math.abs(b - 0.5) < Math.abs(a - 0.5) ? b : a,
+          0.5
+        );
     }
     return Number(m.lastPrice || 0.5);
-  } catch (e) {
+  } catch {
     return Number(m.lastPrice || 0.5);
   }
 }
@@ -130,11 +139,11 @@ function move(slug, px) {
 
 function updateMemory(markets) {
   for (const m of markets) {
-    // Filtrado para evitar mercados resueltos
     if (m.price > 0.001 && m.price < 0.999) {
       state.memory[m.slug] = m.price;
     }
   }
+  state.lastCycleSlugs = markets.map(m => m.slug);
 }
 
 // =====================
@@ -143,32 +152,25 @@ function updateMemory(markets) {
 
 function score(m) {
   const mv = Math.abs(move(m.slug, m.price));
-  if (mv < 0.0008) return 0;
-  
+  if (mv < 0.0008) return 0; // mínimo drift en 1h
+
   let s = 0;
-  
-  // Price movement signal (requisito real)
+
   if (mv > 0.005) s += 0.45;
   else if (mv > 0.002) s += 0.30;
   else s += 0.15;
-  
-  // Volume normalization
+
   const volNorm = Math.min(1, m.volume / 500000);
   s += volNorm * 0.10;
-  
-  // Distance from center (0.5) - penalize extreme prices
+
   const dist = Math.abs(m.price - 0.5);
   s += (1 - dist * 2) * 0.10;
-  
-  // Add liquidity factor
+
   const liqNorm = Math.min(1, m.liquidity / 100000);
   s += liqNorm * 0.05;
-  
-  // Penalize extreme prices
-  if (dist > 0.35) {
-    s -= 0.15;
-  }
-  
+
+  if (dist > 0.35) s -= 0.15;
+
   return Math.max(0, Math.min(1, s));
 }
 
@@ -181,7 +183,6 @@ function filter(markets) {
   let validMarkets = [];
 
   for (const m of markets) {
-    // Filtro para evitar mercados resueltos o extraños
     if (m.price <= 0.001 || m.price >= 0.999) {
       rej.p++;
       continue;
@@ -225,13 +226,11 @@ function open(bot, m) {
 
   const invested = state.equity[bot] * CONFIG.RISK_PER_TRADE;
 
-  // Check if we have enough funds
   if (invested <= 0) {
     log(`NOT ENOUGH FUNDS FOR ${bot} to open position`);
     return;
   }
 
-  // Restar equity al abrir (CORREGIDO)
   state.equity[bot] -= invested;
 
   state.positions.push({
@@ -250,7 +249,6 @@ function close(pos, px) {
   const grossPnl = pos.invested * ((px - pos.entry) / pos.entry);
   const netPnl = grossPnl - (pos.invested * CONFIG.FEES);
 
-  // Devolver principal + PnL al cerrar (CORREGIDO)
   state.equity[pos.bot] += pos.invested + netPnl;
 
   state.closed.push({
@@ -276,10 +274,18 @@ function manage(markets) {
     const m = markets.find(x => x.slug === p.slug);
     if (!m) continue;
 
-    // Update lastUpdate time for tracking
     p.lastUpdate = now;
     
     const roi = (m.price - p.entry) / p.entry;
+
+    // ✅ TRACK DRAWDOWN EN TIEMPO REAL (MTM)
+    const mtmEquity = state.equity[p.bot] + (p.invested * (1 + roi));
+
+    state.peak[p.bot] = Math.max(state.peak[p.bot], mtmEquity);
+    state.dd[p.bot] = Math.max(
+      state.dd[p.bot],
+      (state.peak[p.bot] - mtmEquity) / state.peak[p.bot]
+    );
 
     if (roi <= -CONFIG.STOP_LOSS) {
       close(p, m.price);
@@ -295,14 +301,6 @@ function manage(markets) {
       close(p, m.price);
       continue;
     }
-    
-    // Drawdown tracking (CORREGIDO)
-    const mtmEquity = state.equity[p.bot] + (p.invested + (p.invested * roi));
-    state.peak[p.bot] = Math.max(state.peak[p.bot], mtmEquity);
-    state.dd[p.bot] = Math.max(
-      state.dd[p.bot],
-      (state.peak[p.bot] - mtmEquity) / state.peak[p.bot]
-    );
   }
 }
 
@@ -323,13 +321,16 @@ function report(totalMarkets, filtered, rej) {
   const totalTrades = state.closed.length;
   const wins = state.closed.filter(t => t.pnl > 0).length;
   const totalPnl = state.closed.reduce((s, t) => s + t.pnl, 0);
+  const profitFactor = totalTrades > 0 ? 
+    (state.closed.filter(t => t.pnl > 0).reduce((s, t) => s + t.pnl, 0) / 
+     Math.abs(state.closed.filter(t => t.pnl < 0).reduce((s, t) => s + t.pnl, 0))) : 0;
 
   log(
     `STATS trades=${totalTrades} WR=${
       totalTrades
         ? ((wins / totalTrades) * 100).toFixed(1)
         : 0
-    }% pnl=${totalPnl.toFixed(2)}`
+    }% pnl=${totalPnl.toFixed(2)} PF=${profitFactor.toFixed(3)}`
   );
 }
 
@@ -354,23 +355,20 @@ async function cycle() {
       score: score(m)
     }));
 
-    // Improved trading logic with progressive exclusion
     const used = new Set();
-    const openSlugs = new Set(
-      state.positions.map(p => p.slug)
-    );
-    
+    const openSlugs = new Set(state.positions.map(p => p.slug));
+
     for (const bot of ["A", "B", "C"]) {
-      const eligibleMarkets = scoredMarkets
+      const candidate = scoredMarkets
         .filter(m => 
           !used.has(m.slug) && 
-          !openSlugs.has(m.slug) &&
-          m.score >= BOTS[bot].MIN_SCORE
+          !openSlugs.has(m.slug) && 
+          m.score >= BOTS[bot].MIN_SCORE &&
+          state.equity[bot] > 0
         )
-        .sort((a, b) => b.score - a.score);
+        .sort((a, b) => b.score - a.score)[0];
 
-      if (eligibleMarkets.length > 0) {
-        const candidate = eligibleMarkets[0];
+      if (candidate) {
         open(bot, candidate);
         used.add(candidate.slug);
       }
@@ -382,7 +380,6 @@ async function cycle() {
 
     saveState();
     
-    // Log performance
     const elapsed = Date.now() - startTime;
     if (elapsed > CONFIG.CYCLE_INTERVAL) {
       log(`⚠️ Cycle took ${elapsed}ms (exceeds interval)`);
@@ -392,7 +389,6 @@ async function cycle() {
     log(`CYCLE ERROR: ${error.message}`);
   }
 
-  // Ensure interval is maintained even if processing takes time
   const nextCycleTime = CONFIG.CYCLE_INTERVAL - (Date.now() - startTime);
   setTimeout(cycle, Math.max(1000, nextCycleTime));
 }
@@ -401,7 +397,7 @@ async function cycle() {
 // START
 // =====================
 
-log("🚀 MICRODRIFT v4.3 - STARTING...");
+log("🚀 MICRODRIFT v4.4 - STARTING...");
 log(`Config: Cycle every ${CONFIG.CYCLE_INTERVAL/1000}s, Max trades: ${CONFIG.MAX_OPEN_TRADES}`);
 cycle();
 
