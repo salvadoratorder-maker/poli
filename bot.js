@@ -1,57 +1,41 @@
 // ========================================
-// POLYMARKET MICRODRIFT v4.4
-// Enhanced Paper Trading / Multi-Bot / Persistent (STATISTICAL EDGE VERIFIED)
+// POLYMARKET DRIFT ENGINE v2.0 - BACKTESTABLE
 // ========================================
 
 import fs from "fs";
 import fetch from "node-fetch";
 
+// CONFIGURACIÓN PRINCIPAL
 const CONFIG = {
   API: "https://gamma-api.polymarket.com",
-
   INITIAL_EQUITY: 200,
-
-  PRICE_MIN: 0.20,
-  PRICE_MAX: 0.80,
   MIN_VOLUME: 30000,
   MIN_LIQ: 10000,
-
   RISK_PER_TRADE: 0.02,
   FEES: 0.005,
-
   MAX_OPEN_TRADES: 2,
-  MAX_POSITIONS_PER_MARKET: 1,
-
-  HOLD_TIME: 4 * 60 * 60 * 1000, // 4 horas
-  CYCLE_INTERVAL: 60 * 60 * 1000, // 1 hora — CRÍTICO para drift real
-
+  HOLD_TIME: 4 * 60 * 60 * 1000, // 4h
+  CYCLE_INTERVAL: 60 * 60 * 1000, // 1h
   STOP_LOSS: 0.15,
   TAKE_PROFIT: 0.30,
 };
 
-const BOTS = {
-  A: { MIN_SCORE: 0.10 },
-  B: { MIN_SCORE: 0.14 },
-  C: { MIN_SCORE: 0.12 }
-};
-
-const STATE_FILE = "./state.json";
+const STATE_FILE = "./bt-state.json";
 
 let state = loadState();
 
 function loadState() {
   try {
     return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-  } catch {
+  } catch (e) {
     return {
       cycle: 0,
-      memory: {},
+      memory: {}, // market -> array of prices
       positions: [],
       closed: [],
       equity: { A: 200, B: 200, C: 200 },
       peak: { A: 200, B: 200, C: 200 },
       dd: { A: 0, B: 0, C: 0 },
-      lastCycleSlugs: [],
       lastUpdateTime: Date.now()
     };
   }
@@ -66,317 +50,225 @@ function log(msg) {
 }
 
 // =====================
-// API
+// DATOS DE MERCADO
 // =====================
 
 async function fetchMarkets() {
   try {
     const response = await fetch(
       `${CONFIG.API}/markets?active=true&closed=false&limit=100`,
-      { 
-        headers: {
-          "User-Agent": "Microdrift-Bot/4.4"
-        }
+      {
+        headers: { "User-Agent": "Drift-Engine/2.0" }
       }
     );
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
-    
+
     return data.map(m => ({
       slug: m.slug,
       price: extractPrice(m),
       volume: Number(m.volume24hr || 0),
       liquidity: Number(m.liquidity || 0),
-      lastPrice: Number(m.lastPrice || 0.5),
-      outcomes: m.outcomes || []
+      outcomes: m.outcomes || [],
     }));
-  } catch (error) {
-    log(`FETCH ERROR: ${error.message}`);
+  } catch (e) {
+    log("FETCH ERROR:" + e.message);
     return [];
   }
 }
 
 function extractPrice(m) {
-  try {
-    if (Array.isArray(m.outcomePrices)) {
-      return m.outcomePrices
-        .map(Number)
-        .filter(p => p > 0 && p < 1)
-        .reduce((a, b) =>
-          Math.abs(b - 0.5) < Math.abs(a - 0.5) ? b : a, 
-          0.5
-        );
-    }
-    if (typeof m.outcomePrices === "string") {
-      const arr = JSON.parse(m.outcomePrices);
-      return arr
-        .map(Number)
-        .filter(p => p > 0 && p < 1)
-        .reduce((a, b) =>
-          Math.abs(b - 0.5) < Math.abs(a - 0.5) ? b : a,
-          0.5
-        );
-    }
-    return Number(m.lastPrice || 0.5);
-  } catch {
-    return Number(m.lastPrice || 0.5);
+  const p = (m?.outcomePrices?.[0] || m?.lastPrice);
+  return p ? parseFloat(p) : 0.5;
+}
+
+// =====================
+// HISTORIAL DE PRECIOS
+// =====================
+
+function updateMarketPrice(slug, price) {
+  if (!state.memory[slug]) state.memory[slug] = [];
+  state.memory[slug].push(price);
+  if (state.memory[slug].length > 60) state.memory[slug].shift(); // Mantenemos 60 timestamps
+}
+
+function calculateDrift(slug, lookback = 30) {
+  const prices = state.memory[slug];
+  if (prices.length < lookback + 1) return 0;
+  const start = prices[prices.length - lookback - 1];
+  const end = prices[prices.length - 1];
+  return (end - start) / start;
+}
+
+function calculateVolatility(slug, window = 30) {
+  const prices = state.memory[slug];
+  if (prices.length < window) return 0.01; // Default small vol
+  const returns = [];
+  for (let i = 1; i < prices.length && i <= window; i++) {
+    returns.push(Math.log(prices[i] / prices[i - 1]));
   }
+  const meanRet = returns.reduce((a, b) => a + b, 0) / returns.length;
+  const varRet = returns.map(r => Math.pow(r - meanRet, 2))
+    .reduce((a, b) => a + b, 0) / returns.length;
+  return Math.sqrt(varRet);
 }
 
 // =====================
-// MEMORY
+// FILTRO DE MERCADOS
 // =====================
 
-function move(slug, px) {
-  const prev = state.memory[slug];
-  if (prev === undefined) return 0;
-  return px - prev;
-}
-
-function updateMemory(markets) {
-  for (const m of markets) {
-    if (m.price > 0.001 && m.price < 0.999) {
-      state.memory[m.slug] = m.price;
-    }
-  }
-  state.lastCycleSlugs = markets.map(m => m.slug);
+function filterMarkets(markets) {
+  const filtered = markets.filter(m => {
+    return (
+      m.price > 0.001 &&
+      m.price < 0.999 &&
+      m.volume >= CONFIG.MIN_VOLUME &&
+      m.liquidity >= CONFIG.MIN_LIQ
+    );
+  });
+  return filtered;
 }
 
 // =====================
-// SCORE
-// =====================
-
-function score(m) {
-  const mv = Math.abs(move(m.slug, m.price));
-  if (mv < 0.0008) return 0; // mínimo drift en 1h
-
-  let s = 0;
-
-  if (mv > 0.005) s += 0.45;
-  else if (mv > 0.002) s += 0.30;
-  else s += 0.15;
-
-  const volNorm = Math.min(1, m.volume / 500000);
-  s += volNorm * 0.10;
-
-  const dist = Math.abs(m.price - 0.5);
-  s += (1 - dist * 2) * 0.10;
-
-  const liqNorm = Math.min(1, m.liquidity / 100000);
-  s += liqNorm * 0.05;
-
-  if (dist > 0.35) s -= 0.15;
-
-  return Math.max(0, Math.min(1, s));
-}
-
-// =====================
-// FILTERS
-// =====================
-
-function filter(markets) {
-  let rej = { p: 0, v: 0, l: 0 };
-  let validMarkets = [];
-
-  for (const m of markets) {
-    if (m.price <= 0.001 || m.price >= 0.999) {
-      rej.p++;
-      continue;
-    }
-
-    if (m.price < CONFIG.PRICE_MIN || m.price > CONFIG.PRICE_MAX) {
-      rej.p++;
-      continue;
-    }
-
-    if (m.volume < CONFIG.MIN_VOLUME) {
-      rej.v++;
-      continue;
-    }
-
-    if (m.liquidity < CONFIG.MIN_LIQ) {
-      rej.l++;
-      continue;
-    }
-
-    validMarkets.push(m);
-  }
-
-  return { out: validMarkets, rej };
-}
-
-// =====================
-// POSITIONS
+// GESTIÓN DE POSICIONES
 // =====================
 
 function duplicate(bot, slug) {
   return state.positions.some(p => p.bot === bot && p.slug === slug);
 }
 
-function open(bot, m) {
-  if (duplicate(bot, m.slug)) return;
-
+function open(bot, market) {
   const botOpen = state.positions.filter(p => p.bot === bot).length;
-
   if (botOpen >= CONFIG.MAX_OPEN_TRADES) return;
 
   const invested = state.equity[bot] * CONFIG.RISK_PER_TRADE;
-
-  if (invested <= 0) {
-    log(`NOT ENOUGH FUNDS FOR ${bot} to open position`);
-    return;
-  }
+  if (invested <= 0) return;
 
   state.equity[bot] -= invested;
 
   state.positions.push({
     bot,
-    slug: m.slug,
-    entry: m.price,
+    slug: market.slug,
+    entry: market.price,
     invested,
     opened: Date.now(),
-    lastUpdate: Date.now()
+    lastUpdate: Date.now(),
   });
 
-  log(`OPEN ${bot} ${m.slug} ${m.price.toFixed(3)} score=${m.score.toFixed(2)}`);
+  log(`OPEN ${bot} ${market.slug} (p=${market.price.toFixed(3)})`);
 }
 
-function close(pos, px) {
-  const grossPnl = pos.invested * ((px - pos.entry) / pos.entry);
+function close(pos, price) {
+  const roi = (price - pos.entry) / pos.entry;
+  const grossPnl = pos.invested * roi;
   const netPnl = grossPnl - (pos.invested * CONFIG.FEES);
 
   state.equity[pos.bot] += pos.invested + netPnl;
 
   state.closed.push({
     ...pos,
-    exit: px,
+    exit: price,
     pnl: netPnl,
     closeTime: Date.now()
   });
 
   state.positions = state.positions.filter(p => p !== pos);
-
   log(`CLOSE ${pos.bot} pnl=${netPnl.toFixed(2)}`);
 }
 
 // =====================
-// MANAGEMENT
+// MANEJO DE POSICIONES ABIERTAS
 // =====================
 
-function manage(markets) {
+function managePositions(markets) {
   const now = Date.now();
+  const openPositions = [...state.positions];
+  state.positions = [];
 
-  for (const p of [...state.positions]) {
-    const m = markets.find(x => x.slug === p.slug);
-    if (!m) continue;
-
-    p.lastUpdate = now;
-    
-    const roi = (m.price - p.entry) / p.entry;
-
-    // ✅ TRACK DRAWDOWN EN TIEMPO REAL (MTM)
-    const mtmEquity = state.equity[p.bot] + (p.invested * (1 + roi));
-
-    state.peak[p.bot] = Math.max(state.peak[p.bot], mtmEquity);
-    state.dd[p.bot] = Math.max(
-      state.dd[p.bot],
-      (state.peak[p.bot] - mtmEquity) / state.peak[p.bot]
-    );
-
-    if (roi <= -CONFIG.STOP_LOSS) {
-      close(p, m.price);
+  for (const pos of openPositions) {
+    const market = markets.find(m => m.slug === pos.slug);
+    if (!market) {
+      state.positions.push(pos);
       continue;
     }
 
-    if (roi >= CONFIG.TAKE_PROFIT) {
-      close(p, m.price);
-      continue;
-    }
+    const roi = (market.price - pos.entry) / pos.entry;
 
-    if (now - p.opened > CONFIG.HOLD_TIME) {
-      close(p, m.price);
-      continue;
+    if (roi <= -CONFIG.STOP_LOSS || roi >= CONFIG.TAKE_PROFIT || (now - pos.opened > CONFIG.HOLD_TIME)) {
+      close(pos, market.price);
+    } else {
+      pos.lastUpdate = now;
+      state.positions.push(pos);
     }
   }
 }
 
 // =====================
-// REPORT
+// SELECCIÓN DE TRADES
 // =====================
 
-function report(totalMarkets, filtered, rej) {
-  log(
-    `CYCLE ${state.cycle} total=${totalMarkets} filtered=${filtered.length} open=${state.positions.length} rej[p:${rej.p}|v:${rej.v}|l:${rej.l}]`
-  );
+function selectTrades(markets) {
+  const availableMarkets = markets.filter(m => !state.positions.some(p => p.slug === m.slug));
+  const activeBots = ["A", "B", "C"];
 
+  for (const bot of activeBots) {
+    const candidates = availableMarkets
+      .filter(m => {
+        const drift = calculateDrift(m.slug);
+        const vol = calculateVolatility(m.slug);
+        const entry = m.price;
+        return Math.abs(drift) > 0.002 && vol > 0.01; // Filtros básicos de drift y vol
+      })
+      .sort((a, b) => Math.abs(calculateDrift(b.slug)) - Math.abs(calculateDrift(a.slug)));
+    
+    if (candidates.length > 0) {
+      open(bot, candidates[0]);
+    }
+  }
+}
+
+// =====================
+// REPORTING
+// =====================
+
+function report(stats) {
+  const totalTrades = state.closed.length;
+  const wins = state.closed.filter(t => t.pnl > 0).length;
+  const totalPnl = state.closed.reduce((sum, t) => sum + t.pnl, 0);
+  const winRate = totalTrades ? (wins / totalTrades) * 100 : 0;
+  const avgPnL = totalTrades > 0 ? totalPnl / totalTrades : 0;
+
+  log(`📈 STATS: trades=${totalTrades} WR=${winRate.toFixed(1)}% avgPnL=${avgPnL.toFixed(2)} pnl=${totalPnl.toFixed(2)}`);
+  
   for (const b of ["A", "B", "C"]) {
     const pos = state.positions.filter(p => p.bot === b).length;
     log(`${b} eq=${state.equity[b].toFixed(2)} pos=${pos} DD=${(state.dd[b]*100).toFixed(2)}%`);
   }
-
-  const totalTrades = state.closed.length;
-  const wins = state.closed.filter(t => t.pnl > 0).length;
-  const totalPnl = state.closed.reduce((s, t) => s + t.pnl, 0);
-  const profitFactor = totalTrades > 0 ? 
-    (state.closed.filter(t => t.pnl > 0).reduce((s, t) => s + t.pnl, 0) / 
-     Math.abs(state.closed.filter(t => t.pnl < 0).reduce((s, t) => s + t.pnl, 0))) : 0;
-
-  log(
-    `STATS trades=${totalTrades} WR=${
-      totalTrades
-        ? ((wins / totalTrades) * 100).toFixed(1)
-        : 0
-    }% pnl=${totalPnl.toFixed(2)} PF=${profitFactor.toFixed(3)}`
-  );
 }
 
 // =====================
-// LOOP
+// CICLO PRINCIPAL
 // =====================
 
 async function cycle() {
   state.cycle++;
-
   const startTime = Date.now();
-  
+
   try {
-    const markets = await fetchMarkets();
+    const rawMarkets = await fetchMarkets();
+    const markets = filterMarkets(rawMarkets);
 
-    const { out: filtered, rej } = filter(markets);
+    markets.forEach(m => updateMarketPrice(m.slug, m.price));
 
-    manage(markets);
+    managePositions(markets);
 
-    const scoredMarkets = filtered.map(m => ({
-      ...m,
-      score: score(m)
-    }));
+    selectTrades(markets);
 
-    const used = new Set();
-    const openSlugs = new Set(state.positions.map(p => p.slug));
-
-    for (const bot of ["A", "B", "C"]) {
-      const candidate = scoredMarkets
-        .filter(m => 
-          !used.has(m.slug) && 
-          !openSlugs.has(m.slug) && 
-          m.score >= BOTS[bot].MIN_SCORE &&
-          state.equity[bot] > 0
-        )
-        .sort((a, b) => b.score - a.score)[0];
-
-      if (candidate) {
-        open(bot, candidate);
-        used.add(candidate.slug);
-      }
-    }
-
-    report(markets.length, filtered, rej);
-
-    updateMemory(markets);
+    report({
+      totalMarkets: rawMarkets.length,
+      filtered: markets.length,
+      closed: state.closed.length,
+    });
 
     saveState();
     
@@ -384,32 +276,30 @@ async function cycle() {
     if (elapsed > CONFIG.CYCLE_INTERVAL) {
       log(`⚠️ Cycle took ${elapsed}ms (exceeds interval)`);
     }
-    
-  } catch (error) {
-    log(`CYCLE ERROR: ${error.message}`);
+
+  } catch (e) {
+    log("CYCLE ERROR: " + e.message);
   }
 
-  const nextCycleTime = CONFIG.CYCLE_INTERVAL - (Date.now() - startTime);
-  setTimeout(cycle, Math.max(1000, nextCycleTime));
+  const next = Math.max(1000, CONFIG.CYCLE_INTERVAL - (Date.now() - startTime));
+  setTimeout(cycle, next);
 }
 
 // =====================
-// START
+// INICIÓN DEL BOT
 // =====================
 
-log("🚀 MICRODRIFT v4.4 - STARTING...");
-log(`Config: Cycle every ${CONFIG.CYCLE_INTERVAL/1000}s, Max trades: ${CONFIG.MAX_OPEN_TRADES}`);
+log("🚀 DRIFT ENGINE v2.0 - START");
+log("Config: Cycle every " + (CONFIG.CYCLE_INTERVAL / 1000) + "s Max trades: " + CONFIG.MAX_OPEN_TRADES);
 cycle();
 
-// Add error handling for uncaught exceptions
 process.on('uncaughtException', (err) => {
-  log(`UNCAUGHT EXCEPTION: ${err.message}`);
-  log(err.stack);
+  log("UNCAUGHT EXCEPTION: " + err.message);
   saveState();
   process.exit(1);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  log(`UNHANDLED REJECTION at: ${promise}, reason: ${reason}`);
+  log("UNHANDLED REJECTION: " + reason);
   saveState();
 });
