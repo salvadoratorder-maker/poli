@@ -18,10 +18,10 @@ const CONFIG = {
   INITIAL_EQUITY: 200,
 
   // Filtros de mercado
-  PRICE_MIN: 0.10,       // más amplio que v4 para más oportunidades
-  PRICE_MAX: 0.90,
-  MIN_VOLUME_24H: 50_000, // volumen mínimo robusto
-  MIN_LIQ: 20_000,        // liquidez mínima más estricta
+  PRICE_MIN: 0.05,       // más amplio que v4 para más oportunidades
+  PRICE_MAX: 0.95,
+  MIN_VOLUME_24H: 10_000, // volumen mínimo robusto
+  MIN_LIQ: 5_000,        // liquidez mínima más estricta
 
   // Gestión de riesgo
   RISK_PER_TRADE: 0.025,  // 2.5% del equity por trade
@@ -40,8 +40,8 @@ const CONFIG = {
 
   // Ventana histórica para mean reversion
   HISTORY_WINDOW: 6,       // ciclos para calcular media y desviación
-  REVERSION_THRESHOLD: 1.8, // z-score mínimo para señal (precio alejado de media)
-  MIN_HIST_CYCLES: 3,      // mínimo de datos antes de operar
+  REVERSION_THRESHOLD: 1.5, // z-score mínimo para señal (precio alejado de media)
+  MIN_HIST_CYCLES: 2,      // mínimo de datos antes de operar
 };
 
 // ─── BOTS ─────────────────────────────────────────────────────
