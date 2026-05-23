@@ -1,3 +1,4 @@
+
 // ============================================================
 // MICRODRIFT v5.0 — Paper Trading / Polymarket
 // Estrategia: mean reversion con ventana histórica de precios
@@ -18,10 +19,10 @@ const CONFIG = {
   INITIAL_EQUITY: 200,
 
   // Filtros de mercado
-  PRICE_MIN: 0.15,       // más amplio que v4 para más oportunidades
-  PRICE_MAX: 0.95,
-  MIN_VOLUME_24H: 10_000, // volumen mínimo robusto
-  MIN_LIQ: 5_000,        // liquidez mínima más estricta
+  PRICE_MIN: 0.10,       // más amplio que v4 para más oportunidades
+  PRICE_MAX: 0.90,
+  MIN_VOLUME_24H: 50_000, // volumen mínimo robusto
+  MIN_LIQ: 20_000,        // liquidez mínima más estricta
 
   // Gestión de riesgo
   RISK_PER_TRADE: 0.025,  // 2.5% del equity por trade
@@ -33,15 +34,15 @@ const CONFIG = {
   // Salidas
   STOP_LOSS_ROI: -0.12,   // −12% sobre el capital invertido
   TAKE_PROFIT_ROI: 0.20,  //  +20% sobre el capital invertido
-  MAX_HOLD_MS: 6 * 60 * 60 * 1000, // 6 horas máximo
+  MAX_HOLD_MS: 2 * 60 * 60 * 1000, // 2 horas máximo (reducido de 6h)
 
   // Ciclo
   CYCLE_INTERVAL_MS: 60 * 60 * 1000, // 1 hora
 
   // Ventana histórica para mean reversion
   HISTORY_WINDOW: 6,       // ciclos para calcular media y desviación
-  REVERSION_THRESHOLD: 1.5, // z-score mínimo para señal (precio alejado de media)
-  MIN_HIST_CYCLES: 2,      // mínimo de datos antes de operar
+  REVERSION_THRESHOLD: 1.8, // z-score mínimo para señal (precio alejado de media)
+  MIN_HIST_CYCLES: 3,      // mínimo de datos antes de operar
 };
 
 // ─── BOTS ─────────────────────────────────────────────────────
@@ -50,9 +51,9 @@ const CONFIG = {
 // B: equilibrado
 // C: más agresivo (actúa con anomalías menores)
 const BOTS = {
-  A: { MIN_ZSCORE: 2.0, label: "Conservative" },
+  A: { MIN_ZSCORE: 2.2, label: "Conservative" },
   B: { MIN_ZSCORE: 1.8, label: "Balanced"     },
-  C: { MIN_ZSCORE: 1.8, label: "Aggressive"   },
+  C: { MIN_ZSCORE: 1.4, label: "Aggressive"   },
 };
 
 // ─── ESTADO ───────────────────────────────────────────────────
@@ -454,6 +455,7 @@ async function runCycle() {
 
     // 3. Filtrar mercados
     const { valid, rejected } = filterMarkets(allMarkets);
+    rejected._validSlugs = new Set(valid.map(m => m.slug)); // para audit
 
     // 4. Actualizar historia de precios
     updateHistory(valid);
@@ -484,7 +486,10 @@ async function runCycle() {
       usedSlugs.add(best.slug);
     }
 
-    // 7. Reporte
+    // 7. Rejected alpha audit
+    auditRejected(rejected, allMarkets);
+
+    // 8. Reporte
     printReport(allMarkets.length, valid.length, rejected);
 
     const elapsed = Date.now() - t0;
@@ -509,7 +514,7 @@ async function scheduler() {
 
 // ─── ARRANQUE ─────────────────────────────────────────────────
 log("════════════════════════════════════════════════════════════");
-log("MICRODRIFT v5.0 — Paper Trading System");
+log("MICRODRIFT v5.1 — Paper Trading System");
 log("Estrategia: Mean Reversion sobre ventana histórica de precios");
 log(`Capital: $${CONFIG.INITIAL_EQUITY} × 3 bots = $${CONFIG.INITIAL_EQUITY * 3} total`);
 log(`Fees reales: ${(CONFIG.FEE_RATE * 100).toFixed(0)}% por operación`);
@@ -539,3 +544,77 @@ process.on("SIGINT", () => {
   saveState();
   process.exit(0);
 });
+
+// ─── REJECTED ALPHA AUDIT ─────────────────────────────────────
+// Comprueba si los mercados rechazados por filtros habrían
+// generado señal y alcanzado TP en el ciclo siguiente.
+// Responde: ¿estamos descartando edge real con nuestros filtros?
+
+function auditRejected(rejected, allMarkets) {
+  if (!state.rejectedHistory) state.rejectedHistory = {};
+  if (!state.auditLog)        state.auditLog = [];
+
+  // Guardar historia de precios de rechazados (igual que los válidos)
+  for (const m of allMarkets) {
+    const isRejected = !rejected._validSlugs.has(m.slug);
+    if (!isRejected) continue;
+    if (!state.rejectedHistory[m.slug]) state.rejectedHistory[m.slug] = [];
+    state.rejectedHistory[m.slug].push({ price: m.price, ts: Date.now() });
+    if (state.rejectedHistory[m.slug].length > CONFIG.HISTORY_WINDOW + 2) {
+      state.rejectedHistory[m.slug].shift();
+    }
+  }
+
+  // Para cada rechazado con historia suficiente, calcular si habría señal
+  let wouldHaveSignal = 0;
+  let wouldHaveTP     = 0;
+  const details = [];
+
+  for (const [slug, hist] of Object.entries(state.rejectedHistory)) {
+    if (hist.length < CONFIG.MIN_HIST_CYCLES + 1) continue;
+
+    const prices   = hist.map(h => h.price);
+    const prevPrices = prices.slice(0, -1);
+    const current  = prices[prices.length - 1];
+    const prev     = prices[prices.length - 2];
+
+    const mean = prevPrices.reduce((s, p) => s + p, 0) / prevPrices.length;
+    const std  = Math.sqrt(
+      prevPrices.reduce((s, p) => s + (p - mean) ** 2, 0) / (prevPrices.length - 1)
+    );
+    if (std < 0.005) continue;
+
+    const z = (prev - mean) / std;
+    if (Math.abs(z) < CONFIG.REVERSION_THRESHOLD) continue;
+
+    // Habría habido señal en el ciclo anterior
+    wouldHaveSignal++;
+
+    // ¿El precio actual alcanzó TP (+20%) desde la entrada hipotética?
+    const entryPrice = z < 0 ? prev : 1 - prev;
+    const exitPrice  = z < 0 ? current : 1 - current;
+    const roi        = (exitPrice - entryPrice) / entryPrice;
+
+    if (roi >= CONFIG.TAKE_PROFIT_ROI) {
+      wouldHaveTP++;
+      details.push({ slug, z: z.toFixed(2), roi: (roi * 100).toFixed(0) + "%", entry: entryPrice.toFixed(3) });
+    }
+  }
+
+  if (wouldHaveSignal > 0) {
+    log(`AUDIT | rechazados con señal=${wouldHaveSignal} habrían TP=${wouldHaveTP}`, "WARN");
+    for (const d of details) {
+      log(`  AUDIT-TP ${d.slug.slice(0, 35)} z=${d.z} entry=${d.entry} roi=${d.roi}`, "WARN");
+    }
+    // Guardar en log persistente
+    state.auditLog.push({
+      cycle: state.cycle,
+      ts: Date.now(),
+      wouldHaveSignal,
+      wouldHaveTP,
+      details,
+    });
+    // Mantener últimas 200 entradas
+    if (state.auditLog.length > 200) state.auditLog.shift();
+  }
+}
