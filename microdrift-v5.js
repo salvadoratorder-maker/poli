@@ -18,7 +18,7 @@ const CONFIG = {
   INITIAL_EQUITY: 200,
 
   // Filtros de mercado
-  PRICE_MIN: 0.12,       // más amplio que v4 para más oportunidades
+  PRICE_MIN: 0.15,       // más amplio que v4 para más oportunidades
   PRICE_MAX: 0.95,
   MIN_VOLUME_24H: 10_000, // volumen mínimo robusto
   MIN_LIQ: 5_000,        // liquidez mínima más estricta
