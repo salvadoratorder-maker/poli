@@ -517,3 +517,30 @@ loadState().then(() => scheduler());
 process.on("uncaughtException", err => { log(`Excepción: ${err.message}`, "ERR"); saveState().then(() => process.exit(1)); });
 process.on("unhandledRejection", reason => { log(`Rechazo: ${reason}`, "ERR"); saveState(); });
 process.on("SIGINT", () => { log("Deteniendo..."); saveState().then(() => process.exit(0)); });
+// =====================
+// HEALTH SERVER (para Render Web Service)
+// =====================
+import http from 'http';
+
+const server = http.createServer((req, res) => {
+  if (req.url === '/status' || req.url === '/') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      cycle: state.cycle,
+      equity: state.equity,
+      openPositions: state.positions.length,
+      totalTrades: state.closed.length,
+      totalPnl: state.closed.reduce((s, t) => s + t.pnl, 0),
+      lastUpdate: new Date().toISOString()
+    }, null, 2));
+  } else {
+    res.writeHead(404);
+    res.end();
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`✅ Health server listening on port ${PORT}`);
+  console.log(`📊 Status page: http://localhost:${PORT}/status`);
+});
