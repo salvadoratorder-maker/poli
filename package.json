@@ -1,11 +1,14 @@
 {
   "name": "microdrift",
-  "version": "5.0.0",
+  "version": "5.2.0",
   "type": "module",
+  "engines": {
+    "node": "18.x"
+  },
   "scripts": {
     "start": "node microdrift-v5.js"
   },
   "dependencies": {
-    "node-fetch": "^3.3.2"
+    "node-fetch": "^2.7.0"
   }
 }
