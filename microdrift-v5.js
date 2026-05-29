@@ -1,5 +1,5 @@
 // ============================================================
-// MICRODRIFT v5.2 — Paper Trading / Polymarket + Supabase
+// MICRODRIFT v5.3 — Paper Trading / Polymarket + Supabase
 // Estrategia: mean reversion con ventana histórica de precios
 // Persistencia: Supabase (sobrevive reinicios de Render)
 //
@@ -345,6 +345,8 @@ async function closePosition(pos, exitPrice, reason) {
 
   // Insertar en tabla trades de Supabase (historial completo)
   await dbInsertTrade(pos, exitPrice, netPnl, roi, reason);
+  // Guardar estado inmediatamente tras cada cierre (evita pérdida en reinicios)
+  await saveState();
 }
 
 // ─── GESTIÓN DE POSICIONES ────────────────────────────────────
@@ -503,7 +505,7 @@ async function scheduler() {
 
 // ─── ARRANQUE ─────────────────────────────────────────────────
 log("════════════════════════════════════════════════════════════");
-log("MICRODRIFT v5.2 — Supabase Edition");
+log("MICRODRIFT v5.3 — Supabase Edition");
 log(`Supabase: ${SUPABASE_URL}`);
 log(`Capital: $${CONFIG.INITIAL_EQUITY} × 3 bots = $${CONFIG.INITIAL_EQUITY * 3} total`);
 log(`Timeout: ${CONFIG.MAX_HOLD_MS/60_000}m | Stop: ${CONFIG.STOP_LOSS_ROI*100}% | TP: ${CONFIG.TAKE_PROFIT_ROI*100}%`);
@@ -517,30 +519,27 @@ loadState().then(() => scheduler());
 process.on("uncaughtException", err => { log(`Excepción: ${err.message}`, "ERR"); saveState().then(() => process.exit(1)); });
 process.on("unhandledRejection", reason => { log(`Rechazo: ${reason}`, "ERR"); saveState(); });
 process.on("SIGINT", () => { log("Deteniendo..."); saveState().then(() => process.exit(0)); });
-// =====================
-// HEALTH SERVER (para Render Web Service)
-// =====================
-import http from 'http';
 
-const server = http.createServer((req, res) => {
-  if (req.url === '/status' || req.url === '/') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      cycle: state.cycle,
-      equity: state.equity,
-      openPositions: state.positions.length,
-      totalTrades: state.closed.length,
-      totalPnl: state.closed.reduce((s, t) => s + t.pnl, 0),
-      lastUpdate: new Date().toISOString()
-    }, null, 2));
-  } else {
-    res.writeHead(404);
-    res.end();
-  }
-});
+// ─── HTTP SERVER (necesario para Render Web Service) ──────────
+// Render exige que el proceso escuche en un puerto HTTP.
+// Este servidor solo responde /health con el estado del bot.
+import http from "http";
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`✅ Health server listening on port ${PORT}`);
-  console.log(`📊 Status page: http://localhost:${PORT}/status`);
+
+http.createServer((req, res) => {
+  const totalPnl = state.closed.reduce((s, t) => s + t.pnl, 0);
+  const body = JSON.stringify({
+    status:  "running",
+    cycle:   state.cycle,
+    equity:  state.equity,
+    trades:  state.closed.length,
+    pnl:     totalPnl.toFixed(2),
+    positions: state.positions.length,
+    uptime:  Math.round(process.uptime()) + "s",
+  }, null, 2);
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(body);
+}).listen(PORT, () => {
+  log(`HTTP health server escuchando en puerto ${PORT}`);
 });
