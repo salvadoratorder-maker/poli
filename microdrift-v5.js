@@ -12,7 +12,7 @@
 
 import fetch from "node-fetch";
 
-// ─── CONFIG ──────────────────────────────────────────────────
+// ─── CONFIvG ──────────────────────────────────────────────────
 const CONFIG = {
   API: "https://gamma-api.polymarket.com",
 
