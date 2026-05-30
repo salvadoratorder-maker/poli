@@ -1,5 +1,5 @@
 // ============================================================
-// MICRODRIFT v5.4 — Paper Trading / Polymarket + Supabase
+// MICRODRIFT v5.5 — Paper Trading / Polymarket + Supabase
 // Estrategia: mean reversion con ventana histórica de precios
 // Persistencia: Supabase (sobrevive reinicios de Render)
 //
@@ -151,19 +151,48 @@ async function loadState() {
         dbGet("auditLog"),
       ]);
 
-    if (cycle   !== null) state.cycle           = cycle;
-    if (equity  !== null) state.equity          = equity;
-    if (peak    !== null) state.peak            = peak;
-    if (dd      !== null) state.dd              = dd;
-    if (history !== null) state.history         = history;
-    if (positions !== null) state.positions     = positions;
-    if (closed  !== null) state.closed          = closed;
-    if (rejHist !== null) state.rejectedHistory = rejHist;
-    if (auditLog !== null) state.auditLog       = auditLog;
+    if (cycle     !== null) state.cycle           = cycle;
+    if (equity    !== null) state.equity          = equity;
+    if (peak      !== null) state.peak            = peak;
+    if (dd        !== null) state.dd              = dd;
+    if (history   !== null) state.history         = history;
+    if (positions !== null) state.positions       = positions;
+    if (closed    !== null) state.closed          = closed;
+    if (rejHist   !== null) state.rejectedHistory = rejHist;
+    if (auditLog  !== null) state.auditLog        = auditLog;
 
-    const trades = state.closed.length;
-    const cycles = state.cycle;
-    log(`Estado cargado: ciclo=${cycles} trades_hist=${trades} mercados_mem=${Object.keys(state.history).length}`);
+    // ── Recalcular equity real desde tabla trades ──────────────
+    // El equity en bot_state puede estar desactualizado si el bot
+    // se reinició justo tras un trade. Reconstruimos desde la fuente
+    // de verdad: la tabla trades de Supabase.
+    try {
+      const allTrades = await sbFetch("/trades?select=bot,invested,pnl");
+      if (allTrades && allTrades.length > 0) {
+        // Partir de equity inicial
+        const realEquity = { A: CONFIG.INITIAL_EQUITY, B: CONFIG.INITIAL_EQUITY, C: CONFIG.INITIAL_EQUITY };
+        // Restar lo invertido en posiciones abiertas actualmente
+        for (const pos of state.positions) {
+          realEquity[pos.bot] -= pos.invested;
+        }
+        // Sumar PnL neto de todos los trades cerrados
+        for (const t of allTrades) {
+          if (realEquity[t.bot] !== undefined) {
+            realEquity[t.bot] += t.pnl;
+          }
+        }
+        state.equity = realEquity;
+        state.peak   = {
+          A: Math.max(state.peak.A, realEquity.A),
+          B: Math.max(state.peak.B, realEquity.B),
+          C: Math.max(state.peak.C, realEquity.C),
+        };
+        log(`Equity recalculado desde ${allTrades.length} trades → A=$${realEquity.A.toFixed(2)} B=$${realEquity.B.toFixed(2)} C=$${realEquity.C.toFixed(2)}`);
+      }
+    } catch (eqErr) {
+      log(`No se pudo recalcular equity: ${eqErr.message}`, "WARN");
+    }
+
+    log(`Estado cargado: ciclo=${state.cycle} trades_db=${state.closed.length} mercados_mem=${Object.keys(state.history).length}`);
   } catch (err) {
     log(`Error cargando estado, iniciando desde cero: ${err.message}`, "WARN");
   }
@@ -505,7 +534,7 @@ async function scheduler() {
 
 // ─── ARRANQUE ─────────────────────────────────────────────────
 log("════════════════════════════════════════════════════════════");
-log("MICRODRIFT v5.4 — Supabase Edition");
+log("MICRODRIFT v5.5 — Supabase Edition");
 log(`Supabase: ${SUPABASE_URL}`);
 log(`Capital: $${CONFIG.INITIAL_EQUITY} × 3 bots = $${CONFIG.INITIAL_EQUITY * 3} total`);
 log(`Timeout: ${CONFIG.MAX_HOLD_MS/60_000}m | Stop: ${CONFIG.STOP_LOSS_ROI*100}% | TP: ${CONFIG.TAKE_PROFIT_ROI*100}%`);
