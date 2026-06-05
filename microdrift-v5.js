@@ -1,460 +1,566 @@
-// ==========================================
-// POLYMARKET MEAN REVERSION v5
-// Basado en resultados reales:
-// - Trade 1: Knicks +147% ROI (reversión perfecta)
-// - Trade 2: Knicks TIMEOUT -0.03 (capital inmovilizado)
-//
-// Cambios vs v4.4:
-// ① Cierre dinámico: si 3h y ROI<2% y |zscore|<0.5 → cerrar
-// ② Filtro tendencia: si precio bajando fuerte → no entrar
-// ③ HISTORY_WINDOW 6 → 12
-// ④ FEE_RATE 0.02 → 0.005
-// ==========================================
+```javascript
+// ─── LOGGING ──────────────────────────────────────────────────
+function ts() {
+  return new Date().toISOString().slice(0, 19).replace("T", " ");
+}
 
-import fs from "fs";
-import fetch from "node-fetch";
-const ts  = () => new Date().toISOString().slice(0, 19).replace("T", " ");
-const log = msg => console.log(`[${ts()}] ${msg}`);
-let CONFIG = {
+function log(msg, level = "INFO") {
+  const prefix = level === "WARN" ? "⚠ " : level === "ERR" ? "✖ " : level === "TRADE" ? "◆ " : "  ";
+  console.log(`[${ts()}] ${prefix}${msg}`);
+}
+
+// ─── CONFIvG ──────────────────────────────────────────────────
+const CONFIG = {
   API: "https://gamma-api.polymarket.com",
+
   INITIAL_EQUITY: 200,
 
-  PRICE_MIN:    0.20,
-  PRICE_MAX:    0.80,
-  MIN_VOLUME:   30000,
-  MIN_LIQ:      10000,
+  PRICE_MIN: 0.10,
+  PRICE_MAX: 0.90,
+  MIN_VOLUME_24H: 50_000,
+  MIN_LIQ: 20_000,
 
-  RISK_PER_TRADE: 0.02,
-  FEES:           0.005,  // ④ fix: 0.5% real
+  RISK_PER_TRADE: 0.025,
+  MAX_OPEN_PER_BOT: 2,
 
-  MAX_OPEN_TRADES:           2,
-  MAX_POSITIONS_PER_MARKET:  1,
+  FEE_RATE: 0.02,
 
-  // ③ más historia para z-score estable
-  HISTORY_WINDOW: 12,
+  STOP_LOSS_ROI: -0.12,
+  TAKE_PROFIT_ROI: 0.20,
+  MAX_HOLD_MS: 2 * 60 * 60 * 1000,
 
-  CYCLE_INTERVAL: 60 * 60 * 1000, // 1 hora
+  CYCLE_INTERVAL_MS: 60 * 60 * 1000,
 
-  STOP_LOSS:   0.15,
-  TAKE_PROFIT: 0.30,
-  HOLD_TIME:   24 * 60 * 60 * 1000, // 24h máximo
-
-  // ① Cierre dinámico
-  EARLY_EXIT_MINUTES: 180,  // 3 horas
-  EARLY_EXIT_ROI_MAX: 0.02, // si ROI < 2%
-  EARLY_EXIT_ZSCORE:  0.5,  // y |zscore| < 0.5 → cerrar
-
-  // ② Filtro tendencia
-  SLOPE_THRESHOLD: 0.008,   // si baja >0.8% por ciclo → no entrar
+  HISTORY_WINDOW: 6,
+  REVERSION_THRESHOLD: 1.8,
+  MIN_HIST_CYCLES: 3,
 };
 
 const BOTS = {
-  A: { MIN_ZSCORE: 2.0 },  // estricto
-  B: { MIN_ZSCORE: 1.8 },  // campeón actual — mantener
-  C: { MIN_ZSCORE: 1.8 },  // igual que B — no bajar a 1.2
+  A: { MIN_ZSCORE: 2.0, label: "Conservative" },
+  B: { MIN_ZSCORE: 1.8, label: "Balanced"     },
+  C: { MIN_ZSCORE: 1.8, label: "Aggressive"   },
 };
 
-// ==========================================
-// STATE
-// ==========================================
+// ─── SUPABASE ─────────────────────────────────────────────────
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
-let state = loadState();
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.error("✖ Faltan variables de entorno SUPABASE_URL y/o SUPABASE_KEY");
+  process.exit(1);
+}
 
-function loadState() {
+async function sbFetch(path, method = "GET", body = null) {
+  const opts = {
+    method,
+    headers: {
+      "apikey": SUPABASE_KEY,
+      "Authorization": `Bearer ${SUPABASE_KEY}`,
+      "Content-Type": "application/json",
+      "Prefer": method === "POST" ? "return=minimal,resolution=merge-duplicates" : "",
+    },
+  };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(`${SUPABASE_URL}/rest/v1${path}`, opts);
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Supabase ${method} ${path} → ${res.status}: ${txt}`);
+  }
+  if (method === "GET") return res.json();
+  return null;
+}
+
+// Lee una clave de bot_state
+async function dbGet(key) {
   try {
-    const s = JSON.parse(fs.readFileSync("state.json", "utf8"));
-    log(`✓ Estado cargado | ${Object.keys(BOTS).map(b => `${b}:$${s.equity?.[b]?.toFixed(2)||200}`).join(" ")}`);
-    return s;
-  } catch {
-    log("⚠ Sin estado previo — empezando de cero");
-    return {
-      cycle:     0,
-      history:   {},   // historial de precios por mercado
-      positions: [],
-      closed:    [],
-      equity:    { A: 200, B: 200, C: 200 },
-      peak:      { A: 200, B: 200, C: 200 },
-    };
+    const rows = await sbFetch(`/bot_state?key=eq.${encodeURIComponent(key)}&select=value`);
+    if (rows && rows.length > 0) return rows[0].value;
+    return null;
+  } catch (err) {
+    log(`dbGet(${key}) error: ${err.message}`, "ERR");
+    return null;
   }
 }
 
-function saveState() {
-  fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
-}
-
-
-
-// ==========================================
-// API
-// ==========================================
-
-function extractPrice(m) {
+// Escribe/actualiza una clave en bot_state (upsert)
+async function dbSet(key, value) {
   try {
-    const raw    = JSON.parse(m.outcomePrices || "[]");
-    const prices = (Array.isArray(raw) ? raw : []).map(Number).filter(p => p > 0.001 && p < 0.999);
-    if (!prices.length) return Number(m.lastPrice) || 0;
-    // Precio más cercano a 0.50 — evita mercados resueltos
-    return prices.reduce((a, b) => Math.abs(b-0.5) < Math.abs(a-0.5) ? b : a, prices[0]);
-  } catch {
-    return Number(m.lastPrice) || 0;
+    await sbFetch("/bot_state?on_conflict=key", "POST", {
+      key,
+      value,
+      updated_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    log(`dbSet(${key}) error: ${err.message}`, "ERR");
   }
 }
 
+// Inserta un trade cerrado en la tabla trades
+async function dbInsertTrade(pos, exitPrice, pnl, roi, reason) {
+  try {
+    await sbFetch("/trades", "POST", {
+      bot:        pos.bot,
+      slug:       pos.slug,
+      direction:  pos.direction,
+      entry:      pos.entry,
+      exit:       exitPrice,
+      invested:   pos.invested,
+      pnl,
+      roi,
+      reason,
+      z_score:    pos.zScoreAtEntry || null,
+      opened_at:  new Date(pos.opened).toISOString(),
+      closed_at:  new Date().toISOString(),
+    });
+  } catch (err) {
+    log(`dbInsertTrade error: ${err.message}`, "ERR");
+  }
+}
+
+// ─── ESTADO EN MEMORIA ────────────────────────────────────────
+let state = {
+  cycle:           0,
+  history:         {},
+  positions:       [],
+  closed:          [],
+  equity:          { A: CONFIG.INITIAL_EQUITY, B: CONFIG.INITIAL_EQUITY, C: CONFIG.INITIAL_EQUITY },
+  peak:            { A: CONFIG.INITIAL_EQUITY, B: CONFIG.INITIAL_EQUITY, C: CONFIG.INITIAL_EQUITY },
+  dd:              { A: 0, B: 0, C: 0 },
+  rejectedHistory: {},
+  auditLog:        [],
+};
+
+// Carga estado desde Supabase al arrancar
+async function loadState() {
+  log("Cargando estado desde Supabase...");
+  try {
+    const [cycle, equity, peak, dd, history, positions, closed, rejHist, auditLog] =
+      await Promise.all([
+        dbGet("cycle"),
+        dbGet("equity"),
+        dbGet("peak"),
+        dbGet("dd"),
+        dbGet("history"),
+        dbGet("positions"),
+        dbGet("closed"),
+        dbGet("rejectedHistory"),
+        dbGet("auditLog"),
+      ]);
+
+    if (cycle     !== null) state.cycle           = cycle;
+    if (equity    !== null) state.equity          = equity;
+    if (peak      !== null) state.peak            = peak;
+    if (dd        !== null) state.dd              = dd;
+    if (history   !== null) state.history         = history;
+    if (positions !== null) state.positions       = positions;
+    if (closed    !== null) state.closed          = closed;
+    if (rejHist   !== null) state.rejectedHistory = rejHist;
+    if (auditLog  !== null) state.auditLog        = auditLog;
+
+    // ── Recalcular equity real desde tabla trades ──────────────
+    // El equity en bot_state puede estar desactualizado si el bot
+    // se reinició justo tras un trade. Reconstruimos desde la fuente
+    // de verdad: la tabla trades de Supabase.
+    try {
+      const allTrades = await sbFetch("/trades?select=bot,invested,pnl");
+      if (allTrades && allTrades.length > 0) {
+        // Partir de equity inicial
+        const realEquity = { A: CONFIG.INITIAL_EQUITY, B: CONFIG.INITIAL_EQUITY, C: CONFIG.INITIAL_EQUITY };
+        // Restar lo invertido en posiciones abiertas actualmente
+        for (const pos of state.positions) {
+          realEquity[pos.bot] -= pos.invested;
+        }
+        // Sumar PnL neto de todos los trades cerrados
+        for (const t of allTrades) {
+          if (realEquity[t.bot] !== undefined) {
+            realEquity[t.bot] += t.pnl;
+          }
+        }
+        state.equity = realEquity;
+        state.peak   = {
+          A: Math.max(state.peak.A, realEquity.A),
+          B: Math.max(state.peak.B, realEquity.B),
+          C: Math.max(state.peak.C, realEquity.C),
+        };
+        log(`Equity recalculado desde ${allTrades.length} trades → A=$${realEquity.A.toFixed(2)} B=$${realEquity.B.toFixed(2)} C=$${realEquity.C.toFixed(2)}`);
+      }
+    } catch (eqErr) {
+      log(`No se pudo recalcular equity: ${eqErr.message}`, "WARN");
+    }
+
+    log(`Estado cargado: ciclo=${state.cycle} trades_db=${state.closed.length} mercados_mem=${Object.keys(state.history).length}`);
+  } catch (err) {
+    log(`Error cargando estado, iniciando desde cero: ${err.message}`, "WARN");
+  }
+}
+
+// Guarda estado en Supabase (operaciones en paralelo)
+async function saveState() {
+  try {
+    await Promise.all([
+      dbSet("cycle",           state.cycle),
+      dbSet("equity",          state.equity),
+      dbSet("peak",            state.peak),
+      dbSet("dd",              state.dd),
+      dbSet("history",         state.history),
+      dbSet("positions",       state.positions),
+      dbSet("closed",          state.closed),
+      dbSet("rejectedHistory", state.rejectedHistory),
+      dbSet("auditLog",        state.auditLog),
+    ]);
+  } catch (err) {
+    log(`saveState error: ${err.message}`, "ERR");
+  }
+}
+
+// ─── API POLYMARKET ───────────────────────────────────────────
 async function fetchMarkets() {
   try {
-    const r = await fetch(
-      `${CONFIG.API}/markets?active=true&closed=false&order=volume24hr&ascending=false&limit=50`,
-      { headers: { "User-Agent": "PolyMeanRev/5.0" } }
+    const res = await fetch(
+      `${CONFIG.API}/markets?active=true&closed=false&limit=150`,
+      {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+          "Accept": "application/json, text/plain, */*",
+          "Accept-Language": "en-US,en;q=0.9",
+          "Origin": "https://polymarket.com",
+          "Referer": "https://polymarket.com/",
+        },
+        timeout: 20_000,
+      }
     );
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const data = await r.json();
-
-    return data.map(m => ({
-      slug:      m.slug || m.id,
-      name:      (m.question || "").slice(0, 65),
-      price:     extractPrice(m),
-      volume:    Number(m.volume24hr) || 0,
-      liquidity: Number(m.liquidity)  || 0,
-      endDate:   m.endDate || null,
-    })).filter(m => m.price > 0 && m.slug);
-
-  } catch (e) {
-    log(`❌ API error: ${e.message}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    return data
+      .map(m => ({
+        slug:      m.slug,
+        question:  (m.question || m.slug).slice(0, 60),
+        price:     extractBestPrice(m),
+        volume24h: Number(m.volume24hr || 0),
+        liquidity: Number(m.liquidity || 0),
+      }))
+      .filter(m => m.price > 0.005 && m.price < 0.995);
+  } catch (err) {
+    log(`fetchMarkets failed: ${err.message}`, "ERR");
     return [];
   }
 }
 
-// ==========================================
-// FILTROS
-// ==========================================
-
-function isValid(m) {
-  if (m.price     < CONFIG.PRICE_MIN)  return false;
-  if (m.price     > CONFIG.PRICE_MAX)  return false;
-  if (m.volume    < CONFIG.MIN_VOLUME) return false;
-  if (m.liquidity < CONFIG.MIN_LIQ)    return false;
-
-  // Bloquea mercados que resuelven pronto
-  if (m.endDate) {
-    const h = (new Date(m.endDate) - Date.now()) / 3600000;
-    if (h < 6) return false;
+function extractBestPrice(m) {
+  try {
+    let prices = [];
+    if (Array.isArray(m.outcomePrices)) {
+      prices = m.outcomePrices.map(Number).filter(p => p > 0 && p < 1);
+    } else if (typeof m.outcomePrices === "string") {
+      prices = JSON.parse(m.outcomePrices).map(Number).filter(p => p > 0 && p < 1);
+    }
+    if (prices.length > 0) {
+      return prices.reduce((a, b) =>
+        Math.abs(b - 0.5) < Math.abs(a - 0.5) ? b : a, prices[0]);
+    }
+    return Number(m.lastPrice || 0.5);
+  } catch {
+    return Number(m.lastPrice || 0.5);
   }
-
-  // Bloquea partidos en directo
-  const s = (m.slug || "").toLowerCase();
-  const q = (m.name || "").toLowerCase();
-  const live = ["vs.","vs ","spread:","game ","bo3","bo5","map ","lck","lec"," g1 "," g2 "];
-  if (live.some(k => s.includes(k) || q.includes(k))) return false;
-
-  return true;
 }
 
-// ==========================================
-// ESTADÍSTICAS DE PRECIO (z-score + slope)
-// ==========================================
+// ─── FILTROS ──────────────────────────────────────────────────
+function filterMarkets(markets) {
+  const rejected = { price: 0, volume: 0, liquidity: 0 };
+  const valid = [];
+  for (const m of markets) {
+    if (m.price < CONFIG.PRICE_MIN || m.price > CONFIG.PRICE_MAX) { rejected.price++;    continue; }
+    if (m.volume24h < CONFIG.MIN_VOLUME_24H)                       { rejected.volume++;   continue; }
+    if (m.liquidity < CONFIG.MIN_LIQ)                              { rejected.liquidity++; continue; }
+    valid.push(m);
+  }
+  return { valid, rejected };
+}
 
+// ─── HISTORIA DE PRECIOS ──────────────────────────────────────
 function updateHistory(markets) {
   for (const m of markets) {
     if (!state.history[m.slug]) state.history[m.slug] = [];
     state.history[m.slug].push(m.price);
-    if (state.history[m.slug].length > CONFIG.HISTORY_WINDOW) {
-      state.history[m.slug].shift();
-    }
+    if (state.history[m.slug].length > CONFIG.HISTORY_WINDOW) state.history[m.slug].shift();
+  }
+  const activeSlugs = new Set(markets.map(m => m.slug));
+  for (const slug of Object.keys(state.history)) {
+    if (!activeSlugs.has(slug)) delete state.history[slug];
   }
 }
 
-function getStats(slug) {
-  const h = state.history[slug] || [];
-  if (h.length < 4) return null;
+// ─── SEÑAL: MEAN REVERSION ────────────────────────────────────
+function computeSignal(m) {
+  const hist = state.history[m.slug];
+  if (!hist || hist.length < CONFIG.MIN_HIST_CYCLES) return null;
 
-  const n    = h.length;
-  const mean = h.reduce((a, b) => a+b, 0) / n;
-  const std  = Math.sqrt(h.reduce((a, b) => a + (b-mean)**2, 0) / n);
-  const last = h[n-1];
+  const n    = hist.length;
+  const mean = hist.reduce((s, p) => s + p, 0) / n;
+  const std  = Math.sqrt(hist.reduce((s, p) => s + (p - mean) ** 2, 0) / (n - 1));
+  if (std < 0.005) return null;
 
-  // Z-score: cuántas desviaciones estándar está el precio actual de la media
-  const zscore = std > 0 ? (last - mean) / std : 0;
+  const zScore = (m.price - mean) / std;
 
-  // ② Pendiente: tendencia reciente (últimos 4 puntos)
-  // Si es muy negativa → precio bajando fuerte → posible información nueva
-  const recent = h.slice(-4);
-  const slope  = (recent[recent.length-1] - recent[0]) / recent.length;
-
-  return { mean, std, last, zscore, slope, n };
-}
-
-// ==========================================
-// SEÑAL DE ENTRADA — mean reversion
-// Entra cuando el precio está muy alejado de la media
-// y esperamos que vuelva
-// ==========================================
-
-function getSignal(slug, price) {
-  const stats = getStats(slug);
-  if (!stats) return null;
-
-  const { zscore, slope, mean } = stats;
-
-  // ② Filtro de tendencia fuerte — no cazar cuchillos
-  // Si el precio lleva bajando consistentemente (slope muy negativo)
-  // es probable que sea información nueva, no sobre-reacción
-  if (slope < -CONFIG.SLOPE_THRESHOLD) return null;
-  if (slope >  CONFIG.SLOPE_THRESHOLD * 2) return null; // también evita pumps
-
-  // Solo entra en reversiones alcistas (precio muy bajo → esperamos suba)
-  // zscore muy negativo = precio muy por debajo de la media = oportunidad
-  if (zscore < -2.0) {
-    return {
-      direction: "LONG",
-      zscore,
-      slope,
-      mean,
-      reason: `Precio $${price.toFixed(3)} muy bajo vs media $${mean.toFixed(3)} (z=${zscore.toFixed(2)})`,
-    };
+  let direction, entryPrice, expectedReversion;
+  if (zScore < -CONFIG.REVERSION_THRESHOLD) {
+    direction = "BUY"; entryPrice = m.price; expectedReversion = mean;
+  } else if (zScore > CONFIG.REVERSION_THRESHOLD) {
+    direction = "SELL_PROXY"; entryPrice = 1 - m.price; expectedReversion = 1 - mean;
+  } else {
+    return null;
   }
 
-  // También detecta mercados sobrecomprados para SELL_PROXY
-  // (apostar NO cuando el precio subió demasiado)
-  if (zscore > 2.0) {
-    return {
-      direction: "SELL_PROXY",
-      zscore,
-      slope,
-      mean,
-      reason: `Precio $${price.toFixed(3)} muy alto vs media $${mean.toFixed(3)} (z=${zscore.toFixed(2)})`,
-    };
-  }
+  const absZScore = Math.abs(zScore);
+  const volBonus  = Math.min(1.2, 1 + (m.volume24h - CONFIG.MIN_VOLUME_24H) / 500_000);
+  const liqBonus  = Math.min(1.1, 1 + (m.liquidity - CONFIG.MIN_LIQ) / 200_000);
 
-  return null;
+  return { direction, entryPrice, expectedReversion, zScore, absZScore, qualScore: absZScore * volBonus * liqBonus, mean, std };
 }
 
-// ==========================================
-// ABRIR TRADE
-// ==========================================
-
-function hasDuplicate(bot, slug) {
-  return state.positions.some(p => p.bot === bot && p.slug === slug);
+// ─── POSICIONES ───────────────────────────────────────────────
+function calcPnl(entry, exit, invested) {
+  const shares = invested / entry;
+  return shares * (exit - entry) - invested * CONFIG.FEE_RATE;
 }
 
-function openTrade(bot, m, signal) {
-  if (hasDuplicate(bot, m.slug)) return false;
-
-  const botOpen = state.positions.filter(p => p.bot === bot).length;
-  if (botOpen >= CONFIG.MAX_OPEN_TRADES) return false;
+function openPosition(bot, m, signal) {
+  if (state.positions.some(p => p.bot === bot && p.slug === m.slug)) return;
+  if (state.positions.filter(p => p.bot === bot).length >= CONFIG.MAX_OPEN_PER_BOT) return;
+  if (state.equity[bot] < 10) return;
 
   const invested = state.equity[bot] * CONFIG.RISK_PER_TRADE;
-  const fee      = invested * CONFIG.FEES;
-  if (state.equity[bot] < invested + fee) return false;
-
-  state.equity[bot] -= (invested + fee);
+  state.equity[bot] -= invested;
 
   state.positions.push({
-    bot,
-    slug:      m.slug,
-    name:      m.name,
-    direction: signal.direction,
-    entry:     m.price,
-    invested,
-    zscore:    signal.zscore,
-    slope:     signal.slope,
-    mean:      signal.mean,
-    peak:      m.price,
-    openedAt:  Date.now(),
+    bot, slug: m.slug, question: m.question,
+    direction: signal.direction, entry: signal.entryPrice,
+    expectedExit: signal.expectedReversion, zScoreAtEntry: signal.zScore,
+    invested, shares: invested / signal.entryPrice,
+    opened: Date.now(), cycleOpened: state.cycle,
   });
 
-  log(`🟢 OPEN ${bot} [${signal.direction}] ${m.name.slice(0, 40)}`);
-  log(`   @${m.price.toFixed(3)} | $${invested.toFixed(2)} | z=${signal.zscore.toFixed(2)} | ${signal.reason}`);
-  return true;
+  log(`OPEN ${bot} [${signal.direction}] ${m.slug.slice(0, 30)} entry=${signal.entryPrice.toFixed(3)} z=${signal.zScore.toFixed(2)} $${invested.toFixed(2)}`, "TRADE");
 }
 
-// ==========================================
-// CERRAR TRADE
-// ==========================================
+async function closePosition(pos, exitPrice, reason) {
+  const netPnl = calcPnl(pos.entry, exitPrice, pos.invested);
+  state.equity[pos.bot] += pos.invested + netPnl;
 
-function closeTrade(pos, price, reason) {
-  // Para SELL_PROXY: ganamos si el precio baja
-  const direction = pos.direction === "SELL_PROXY" ? -1 : 1;
-  const roi       = ((price - pos.entry) / pos.entry) * direction;
-  const gross     = pos.invested * (1 + roi);
-  const fee       = gross * CONFIG.FEES;
-  const net       = gross - fee;
-  const pnl       = net - pos.invested;
-
-  state.equity[pos.bot] += net;
-
-  // Actualiza peak
   const eq = state.equity[pos.bot];
-  if (eq > state.peak[pos.bot]) state.peak[pos.bot] = eq;
+  state.peak[pos.bot] = Math.max(state.peak[pos.bot], eq);
+  state.dd[pos.bot]   = Math.max(state.dd[pos.bot], (state.peak[pos.bot] - eq) / state.peak[pos.bot]);
 
-  state.closed.push({
-    ...pos,
-    exit:      price,
-    roi,
-    pnl,
-    reason,
-    closedAt:  Date.now(),
-  });
+  const roi = netPnl / pos.invested;
+
+  state.closed.push({ ...pos, exit: exitPrice, pnl: netPnl, roi, reason, closeTime: Date.now() });
+  // Mantener solo los últimos 500 trades en memoria para no inflar Supabase
+  if (state.closed.length > 500) state.closed.shift();
 
   state.positions = state.positions.filter(p => p !== pos);
 
-  log(`${pnl>=0?"💰":"🛑"} CLOSE ${pos.bot} (${reason}) @${pos.entry.toFixed(3)}→@${price.toFixed(3)} | PnL: ${pnl>=0?"+":""}$${pnl.toFixed(2)} | ROI: ${(roi*100).toFixed(1)}%`);
+  const sign = netPnl > 0 ? "+" : "";
+  log(`CLOSE ${pos.bot} [${reason}] ${pos.slug.slice(0, 25)} pnl=${sign}$${netPnl.toFixed(2)} roi=${(roi*100).toFixed(1)}%`, "TRADE");
+
+  // Insertar en tabla trades de Supabase (historial completo)
+  await dbInsertTrade(pos, exitPrice, netPnl, roi, reason);
+  // Guardar estado inmediatamente tras cada cierre (evita pérdida en reinicios)
+  await saveState();
 }
 
-// ==========================================
-// GESTIONAR TRADES ABIERTOS
-// ==========================================
-
-function manage(markets) {
+// ─── GESTIÓN DE POSICIONES ────────────────────────────────────
+async function managePositions(markets) {
   const now = Date.now();
+  const priceMap = new Map(markets.map(m => [m.slug, m.price]));
 
-  for (const p of [...state.positions]) {
-    const m = markets.find(x => x.slug === p.slug);
-    if (!m) continue;
+  for (const pos of [...state.positions]) {
+    const raw = priceMap.get(pos.slug);
+    if (raw === undefined) continue;
 
-    const direction = p.direction === "SELL_PROXY" ? -1 : 1;
-    const roi       = ((m.price - p.entry) / p.entry) * direction;
-    const ageMin    = (now - p.openedAt) / 60000;
+    const eff = pos.direction === "SELL_PROXY" ? 1 - raw : raw;
+    const roi = (eff - pos.entry) / pos.entry;
 
-    if (m.price > p.peak) p.peak = m.price;
+    if (roi <= CONFIG.STOP_LOSS_ROI)                        { await closePosition(pos, eff, "STOP_LOSS");         continue; }
+    if (roi >= CONFIG.TAKE_PROFIT_ROI)                      { await closePosition(pos, eff, "TAKE_PROFIT");       continue; }
+    if (now - pos.opened > CONFIG.MAX_HOLD_MS)              { await closePosition(pos, eff, "TIMEOUT");           continue; }
 
-    // Stop loss
-    if (roi <= -CONFIG.STOP_LOSS) {
-      closeTrade(p, m.price, "STOP_LOSS"); continue;
-    }
-
-    // Take profit
-    if (roi >= CONFIG.TAKE_PROFIT) {
-      closeTrade(p, m.price, "TAKE_PROFIT"); continue;
-    }
-
-    // Timeout máximo
-    if (now - p.openedAt > CONFIG.HOLD_TIME) {
-      closeTrade(p, m.price, "TIMEOUT"); continue;
-    }
-
-    // ① CIERRE DINÁMICO — evita capital inmovilizado
-    // Si llevamos X horas, el ROI es mínimo Y el z-score ya normalizó
-    if (ageMin > CONFIG.EARLY_EXIT_MINUTES) {
-      const stats = getStats(p.slug);
-      const zNow  = stats ? Math.abs(stats.zscore) : 0;
-
-      if (roi < CONFIG.EARLY_EXIT_ROI_MAX && zNow < CONFIG.EARLY_EXIT_ZSCORE) {
-        closeTrade(p, m.price, `EARLY_EXIT(${ageMin.toFixed(0)}min ROI${(roi*100).toFixed(1)}% z${zNow.toFixed(2)})`);
-        continue;
-      }
-    }
+    const progress = Math.abs(eff - pos.entry) / Math.abs(pos.expectedExit - pos.entry);
+    if (progress > 0.6 && roi > 0.05)                       { await closePosition(pos, eff, "PARTIAL_REVERSION"); continue; }
   }
 }
 
-// ==========================================
-// EDGE ANALYZER
-// ==========================================
+// ─── REJECTED ALPHA AUDIT ────────────────────────────────────
+function auditRejected(rejected, allMarkets) {
+  if (!state.rejectedHistory) state.rejectedHistory = {};
+  if (!state.auditLog)        state.auditLog = [];
 
-function analyzeEdge() {
-  const trades = state.closed;
-  if (trades.length < 5) {
-    log(`🔬 EDGE: Solo ${trades.length}/5 trades — necesito más datos`);
-    return;
+  for (const m of allMarkets) {
+    if (rejected._validSlugs.has(m.slug)) continue;
+    if (!state.rejectedHistory[m.slug]) state.rejectedHistory[m.slug] = [];
+    state.rejectedHistory[m.slug].push({ price: m.price, ts: Date.now() });
+    if (state.rejectedHistory[m.slug].length > CONFIG.HISTORY_WINDOW + 2) state.rejectedHistory[m.slug].shift();
   }
 
-  const wins    = trades.filter(t => t.pnl > 0);
-  const losses  = trades.filter(t => t.pnl <= 0);
-  const wr      = wins.length / trades.length;
-  const avgWin  = wins.length   > 0 ? wins.reduce((a,t) => a+t.pnl, 0) / wins.length   : 0;
-  const avgLoss = losses.length > 0 ? Math.abs(losses.reduce((a,t) => a+t.pnl, 0) / losses.length) : 0;
-  const exp     = (wr * avgWin) - ((1-wr) * avgLoss);
-  const pf      = avgLoss > 0 ? (wr * avgWin) / ((1-wr) * avgLoss) : 0;
-  const status  = exp > 0 ? "✅ EDGE" : "❌ NO_EDGE";
+  let wouldHaveSignal = 0, wouldHaveTP = 0;
+  const details = [];
 
-  log(`🔬 ${status} | Exp: ${exp>=0?"+":""}$${exp.toFixed(3)} | WR: ${(wr*100).toFixed(0)}% | PF: ${pf.toFixed(2)} | AvgW: +$${avgWin.toFixed(2)} AvgL: -$${avgLoss.toFixed(2)}`);
+  for (const [slug, hist] of Object.entries(state.rejectedHistory)) {
+    if (hist.length < CONFIG.MIN_HIST_CYCLES + 1) continue;
+    const prices     = hist.map(h => h.price);
+    const prevPrices = prices.slice(0, -1);
+    const current    = prices[prices.length - 1];
+    const prev       = prices[prices.length - 2];
+    const mean       = prevPrices.reduce((s, p) => s + p, 0) / prevPrices.length;
+    const std        = Math.sqrt(prevPrices.reduce((s, p) => s + (p - mean) ** 2, 0) / (prevPrices.length - 1));
+    if (std < 0.005) continue;
+    const z = (prev - mean) / std;
+    if (Math.abs(z) < CONFIG.REVERSION_THRESHOLD) continue;
+    wouldHaveSignal++;
+    const entryPrice = z < 0 ? prev : 1 - prev;
+    const exitPrice  = z < 0 ? current : 1 - current;
+    const roi        = (exitPrice - entryPrice) / entryPrice;
+    if (roi >= CONFIG.TAKE_PROFIT_ROI) {
+      wouldHaveTP++;
+      details.push({ slug, z: z.toFixed(2), roi: (roi * 100).toFixed(0) + "%", entry: entryPrice.toFixed(3) });
+    }
+  }
 
-  // Por bot
-  for (const b of ["A","B","C"]) {
-    const bt = trades.filter(t => t.bot === b);
-    if (bt.length === 0) continue;
-    const bw  = bt.filter(t => t.pnl > 0).length;
-    const bpnl = bt.reduce((a,t) => a+t.pnl, 0);
-    log(`   BOT ${b}: ${bt.length} trades | WR: ${(bw/bt.length*100).toFixed(0)}% | PnL total: ${bpnl>=0?"+":""}$${bpnl.toFixed(2)}`);
+  if (wouldHaveSignal > 0) {
+    log(`AUDIT | rechazados con señal=${wouldHaveSignal} habrían TP=${wouldHaveTP}`, "WARN");
+    for (const d of details) log(`  AUDIT-TP ${d.slug.slice(0, 35)} z=${d.z} entry=${d.entry} roi=${d.roi}`, "WARN");
+    state.auditLog.push({ cycle: state.cycle, ts: Date.now(), wouldHaveSignal, wouldHaveTP, details });
+    if (state.auditLog.length > 200) state.auditLog.shift();
   }
 }
 
-// ==========================================
-// CICLO PRINCIPAL
-// ==========================================
+// ─── REPORTE ──────────────────────────────────────────────────
+function printReport(totalMarkets, validCount, rejected) {
+  const div = "─".repeat(60);
+  log(div);
+  log(`CICLO ${state.cycle} | Mercados: ${totalMarkets} total, ${validCount} válidos`);
+  log(`Rechazados → precio:${rejected.price} vol:${rejected.volume} liq:${rejected.liquidity}`);
 
-async function cycle() {
+  for (const b of ["A", "B", "C"]) {
+    const openPos   = state.positions.filter(p => p.bot === b);
+    const botClosed = state.closed.filter(t => t.bot === b);
+    const wins      = botClosed.filter(t => t.pnl > 0).length;
+    const pnl       = botClosed.reduce((s, t) => s + t.pnl, 0);
+    const wr        = botClosed.length ? ((wins / botClosed.length) * 100).toFixed(0) : "—";
+    log(`BOT ${b} (${BOTS[b].label}) | equity=$${state.equity[b].toFixed(2)} | pos=${openPos.length}/${CONFIG.MAX_OPEN_PER_BOT} | DD=${(state.dd[b]*100).toFixed(1)}% | trades=${botClosed.length} WR=${wr}% pnl=$${pnl.toFixed(2)}`);
+    for (const p of openPos) {
+      const age = Math.round((Date.now() - p.opened) / 60_000);
+      log(`  └ ${p.direction} ${p.slug.slice(0, 35)} | entry=${p.entry.toFixed(3)} | age=${age}m`);
+    }
+  }
+
+  const allClosed = state.closed;
+  if (allClosed.length > 0) {
+    const wins     = allClosed.filter(t => t.pnl > 0);
+    const losses   = allClosed.filter(t => t.pnl < 0);
+    const totalPnl = allClosed.reduce((s, t) => s + t.pnl, 0);
+    const gw       = wins.reduce((s, t) => s + t.pnl, 0);
+    const gl       = Math.abs(losses.reduce((s, t) => s + t.pnl, 0));
+    const pf       = gl > 0 ? (gw / gl).toFixed(2) : "∞";
+    const wr       = ((wins.length / allClosed.length) * 100).toFixed(1);
+    log(`GLOBAL | trades=${allClosed.length} WR=${wr}% PF=${pf} pnl=$${totalPnl.toFixed(2)}`);
+    const byReason = {};
+    for (const t of allClosed) {
+      if (!byReason[t.reason]) byReason[t.reason] = { n: 0, pnl: 0 };
+      byReason[t.reason].n++; byReason[t.reason].pnl += t.pnl;
+    }
+    for (const [r, s] of Object.entries(byReason)) log(`  ${r}: ${s.n} trades pnl=$${s.pnl.toFixed(2)}`);
+  }
+  log(div);
+}
+
+// ─── CICLO PRINCIPAL ──────────────────────────────────────────
+async function runCycle() {
   state.cycle++;
-  log(`\n════ CICLO ${state.cycle} ════`);
-
+  const t0 = Date.now();
   try {
-    const markets  = await fetchMarkets();
-    if (!markets.length) {
-      log("⚠ Sin mercados");
-      return setTimeout(cycle, CONFIG.CYCLE_INTERVAL);
+    const allMarkets = await fetchMarkets();
+    if (allMarkets.length === 0) { log("Sin mercados, reintentando...", "WARN"); return; }
+
+    await managePositions(allMarkets);
+
+    const { valid, rejected } = filterMarkets(allMarkets);
+    rejected._validSlugs = new Set(valid.map(m => m.slug));
+
+    updateHistory(valid);
+
+    const candidates = valid
+      .map(m => ({ ...m, signal: computeSignal(m) }))
+      .filter(m => m.signal);
+
+    const usedSlugs = new Set(state.positions.map(p => p.slug));
+    for (const [bot, botConfig] of Object.entries(BOTS)) {
+      const eligible = candidates
+        .filter(c => !usedSlugs.has(c.slug) && c.signal.absZScore >= botConfig.MIN_ZSCORE && state.equity[bot] > 10)
+        .sort((a, b) => b.signal.qualScore - a.signal.qualScore);
+      if (!eligible.length) continue;
+      openPosition(bot, eligible[0], eligible[0].signal);
+      usedSlugs.add(eligible[0].slug);
     }
 
-    updateHistory(markets);
-    manage(markets);
+    auditRejected(rejected, allMarkets);
+    printReport(allMarkets.length, valid.length, rejected);
+    log(`Ciclo completado en ${Date.now() - t0}ms`);
 
-    const filtered = markets.filter(m => isValid(m));
-    log(`✓ ${markets.length} mercados | ${filtered.length} válidos`);
-
-    // Buscar entradas para cada bot
-    const used = new Set(state.positions.map(p => p.slug));
-    let opened = 0;
-
-    for (const b of ["A","B","C"]) {
-      const botOpen = state.positions.filter(p => p.bot === b).length;
-      if (botOpen >= CONFIG.MAX_OPEN_TRADES) continue;
-
-      const candidates = filtered
-        .filter(m => !hasDuplicate(b, m.slug))
-        .map(m => {
-          const signal = getSignal(m.slug, m.price);
-          return signal ? { m, signal } : null;
-        })
-        .filter(Boolean)
-        .filter(x => Math.abs(x.signal.zscore) >= BOTS[b].MIN_ZSCORE)
-        .sort((a, b) => Math.abs(b.signal.zscore) - Math.abs(a.signal.zscore));
-
-      if (candidates.length === 0) continue;
-
-      const best = candidates[0];
-      if (openTrade(b, best.m, best.signal)) opened++;
-    }
-
-    if (opened === 0) log(`ℹ Sin señales válidas`);
-
-    // Stats
-    log("");
-    for (const b of ["A","B","C"]) {
-      const eq  = state.equity[b];
-      const pnl = eq - CONFIG.INITIAL_EQUITY;
-      const dd  = state.peak[b] > 0 ? ((state.peak[b]-eq)/state.peak[b]*100).toFixed(1) : "0.0";
-      const pos = state.positions.filter(p => p.bot === b).length;
-      log(`BOT ${b}(z≥${BOTS[b].MIN_ZSCORE}) | Equity: $${eq.toFixed(2)} | PnL: ${pnl>=0?"+":""}$${pnl.toFixed(2)} | DD: ${dd}% | Abiertos: ${pos}`);
-    }
-
-    analyzeEdge();
-    saveState();
-
-  } catch (e) {
-    log(`❌ ERR: ${e.message}`);
-    saveState();
+  } catch (err) {
+    log(`Error en ciclo: ${err.message}`, "ERR");
+    console.error(err.stack);
+  } finally {
+    await saveState();
   }
-
-  setTimeout(cycle, CONFIG.CYCLE_INTERVAL);
 }
 
-// ==========================================
-// START
-// ==========================================
+// ─── SCHEDULER ────────────────────────────────────────────────
+async function scheduler() {
+  const t0 = Date.now();
+  await runCycle();
+  const delay = Math.max(5_000, CONFIG.CYCLE_INTERVAL_MS - (Date.now() - t0));
+  setTimeout(scheduler, delay);
+}
 
-process.on("uncaughtException", e => { log(`FATAL: ${e.message}`); saveState(); process.exit(1); });
-process.on("unhandledRejection", e => { log(`REJECTION: ${e}`); saveState(); });
+// ─── ARRANQUE ─────────────────────────────────────────────────
+log("════════════════════════════════════════════════════════════");
+log("MICRODRIFT v5.5 — Supabase Edition");
+log(`Supabase: ${SUPABASE_URL}`);
+log(`Capital: $${CONFIG.INITIAL_EQUITY} × 3 bots = $${CONFIG.INITIAL_EQUITY * 3} total`);
+log(`Timeout: ${CONFIG.MAX_HOLD_MS/60_000}m | Stop: ${CONFIG.STOP_LOSS_ROI*100}% | TP: ${CONFIG.TAKE_PROFIT_ROI*100}%`);
+log("════════════════════════════════════════════════════════════");
+log("AVISO: Esto es PAPER TRADING. No opera con dinero real.");
+log("════════════════════════════════════════════════════════════");
 
-log("🚀 PolyMeanReversion v5");
-log(`   Bots: ${Object.entries(BOTS).map(([k,v])=>`${k}(z≥${v.MIN_ZSCORE})`).join(" ")}`);
-log(`   HistoryWindow: ${CONFIG.HISTORY_WINDOW} | Fees: ${CONFIG.FEES*100}% | Ciclo: 1h`);
-log(`   EarlyExit: ${CONFIG.EARLY_EXIT_MINUTES}min si ROI<${CONFIG.EARLY_EXIT_ROI_MAX*100}% y |z|<${CONFIG.EARLY_EXIT_ZSCORE}`);
-cycle();
+// Cargar estado y arrancar
+loadState().then(() => scheduler());
+
+process.on("uncaughtException", err => { log(`Excepción: ${err.message}`, "ERR"); saveState().then(() => process.exit(1)); });
+process.on("unhandledRejection", reason => { log(`Rechazo: ${reason}`, "ERR"); saveState(); });
+process.on("SIGINT", () => { log("Deteniendo..."); saveState().then(() => process.exit(0)); });
+
+// ─── HTTP SERVER (necesario para Render Web Service) ──────────
+// Render exige que el proceso escuche en un puerto HTTP.
+// Este servidor solo responde /health con el estado del bot.
+import http from "http";
+
+const PORT = process.env.PORT || 3000;
+
+http.createServer((req, res) => {
+  const totalPnl = state.closed.reduce((s, t) => s + t.pnl, 0);
+  const body = JSON.stringify({
+    status:  "running",
+    cycle:   state.cycle,
+    equity:  state.equity,
+    trades:  state.closed.length,
+    pnl:     totalPnl.toFixed(2),
+    positions: state.positions.length,
+    uptime:  Math.round(process.uptime()) + "s",
+  }, null, 2);
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(body);
+}).listen(PORT, () => {
+  log(`HTTP health server escuchando en puerto ${PORT}`);
+});
+```
