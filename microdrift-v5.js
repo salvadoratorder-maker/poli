@@ -13,7 +13,8 @@
 
 import fs from "fs";
 import fetch from "node-fetch";
-
+const ts  = () => new Date().toISOString().slice(0, 19).replace("T", " ");
+const log = msg => console.log(`[${ts()}] ${msg}`);
 let CONFIG = {
   API: "https://gamma-api.polymarket.com",
   INITIAL_EQUITY: 200,
@@ -81,8 +82,7 @@ function saveState() {
   fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
 }
 
-const ts  = () => new Date().toISOString().slice(0, 19).replace("T", " ");
-const log = msg => console.log(`[${ts()}] ${msg}`);
+
 
 // ==========================================
 // API
