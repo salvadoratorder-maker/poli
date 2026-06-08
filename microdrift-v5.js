@@ -18,40 +18,45 @@ const CONFIG = {
   PRICE_MAX: 0.95,
 
   MIN_VOLUME_24H: 50_000,
-  MIN_LIQ:        20_000,   // umbral base — se escala por scaledMinLiq()
+  MIN_LIQ:        20_000,
 
-  RISK_PER_TRADE:  0.025,
+  RISK_PER_TRADE:   0.025,
   MAX_OPEN_PER_BOT: 2,
 
   FEE_RATE: 0.02,
 
-  STOP_LOSS_ROI:   -0.12,
-  TAKE_PROFIT_ROI:  0.25,
-
-  // Mercados con precio de entrada < umbral tienen TP más amplio
-  LOW_PRICE_THRESHOLD: 0.15,
-  LOW_PRICE_TP_ROI:    0.50,
+  // Mercados con precio YES > HIGH_PRICE_THRESHOLD tienen TP reducido
+  // (poco margen para que el NO suba mucho)
+  HIGH_PRICE_THRESHOLD: 0.80,
+  HIGH_PRICE_TP_FACTOR: 0.6,   // multiplica el TP del bot en mercados muy altos
 
   MAX_HOLD_MS: 4 * 60 * 60 * 1000,   // 4h
 
   CYCLE_INTERVAL_MS: 60 * 60 * 1000, // 1h
 
-  // FIX 3: ventana histórica ampliada a 24 ciclos (antes: 6)
   HISTORY_WINDOW:   24,
-  MIN_HIST_CYCLES:   6,   // mínimo para calcular z-score fiable
+  MIN_HIST_CYCLES:   6,
 
-  // FIX 1: filtro de tendencia — no entrar contra tendencia sostenida
-  // Si el precio lleva N ciclos moviéndose en la misma dirección, no es reversión
-  TREND_WINDOW:     4,    // ciclos para detectar tendencia
-  TREND_THRESHOLD:  0.03, // cambio acumulado > 3% en TREND_WINDOW → tendencia activa
+  // Filtro de tendencia
+  TREND_WINDOW:     4,
+  TREND_THRESHOLD:  0.03,
 
+  // Cooldown tras stop loss
   STOP_LOSS_COOLDOWN_CYCLES: 3,
 };
 
+// ─── BOTS ─────────────────────────────────────────────────────
+// Los tres bots operan ÚNICAMENTE SELL_PROXY (comprar NO).
+// El edge demostrado en los datos es: precio YES anormalmente alto
+// → comprar NO → esperar reversión a la media.
+//
+// Bot A — base, entrada con z >= 2.0, TP 25%
+// Bot B — selectivo, z >= 2.3, TP 35% (deja correr más la reversión)
+// Bot C — oportunista, z >= 2.8, TP 50% (espera señales tipo Weinstein)
 const BOTS = {
-  A: { MIN_ZSCORE: 2.0, label: "Conservative" },
-  B: { MIN_ZSCORE: 2.2, label: "Balanced"     },
-  C: { MIN_ZSCORE: 2.5, label: "Aggressive"   },
+  A: { MIN_ZSCORE: 2.0, TAKE_PROFIT_ROI: 0.25, STOP_LOSS_ROI: -0.12, label: "Base"        },
+  B: { MIN_ZSCORE: 2.3, TAKE_PROFIT_ROI: 0.35, STOP_LOSS_ROI: -0.10, label: "Selectivo"   },
+  C: { MIN_ZSCORE: 2.8, TAKE_PROFIT_ROI: 0.50, STOP_LOSS_ROI: -0.08, label: "Oportunista" },
 };
 
 // ─── SUPABASE ─────────────────────────────────────────────────
@@ -224,7 +229,7 @@ async function saveState() {
 // ─── API POLYMARKET ───────────────────────────────────────────
 async function fetchMarkets() {
   const url = `${CONFIG.API}/markets?active=true&closed=false&limit=100`;
-  const res  = await fetch(url, { headers: { "User-Agent": "DriftBot/4.0" } });
+  const res  = await fetch(url, { headers: { "User-Agent": "DriftBot/5.0" } });
   if (!res.ok) throw new Error(`fetchMarkets HTTP ${res.status}`);
   return res.json();
 }
@@ -244,70 +249,49 @@ function stddev(arr) {
   return Math.sqrt(arr.reduce((a, b) => a + (b - m) ** 2, 0) / arr.length);
 }
 
-// Z-score: desviación del último precio respecto a la media histórica previa
 function zScore(arr) {
   if (arr.length < 2) return 0;
-  const history = arr.slice(0, -1);  // todo menos el último
+  const history = arr.slice(0, -1);
   const sd = stddev(history);
   if (sd === 0) return 0;
   return (arr[arr.length - 1] - mean(history)) / sd;
 }
 
-// ─── FIX 1: FILTRO DE TENDENCIA ───────────────────────────────
-// Una señal de reversión es válida SOLO si el movimiento reciente
-// es brusco (spike), no una tendencia sostenida.
-// Si el precio lleva TREND_WINDOW ciclos moviéndose en la misma
-// dirección con cambio acumulado > TREND_THRESHOLD → no es reversión,
-// es información nueva. Rechazamos la señal.
+// ─── FILTRO DE TENDENCIA ──────────────────────────────────────
+// Rechaza señales donde el precio lleva N ciclos subiendo
+// de forma monotónica y sostenida — no es reversión, es información.
 function isActiveTrend(hist) {
   if (hist.length < CONFIG.TREND_WINDOW + 1) return false;
   const recent = hist.slice(-(CONFIG.TREND_WINDOW + 1));
-  const start  = recent[0];
-  const end    = recent[recent.length - 1];
-  const change = (end - start) / start;
-
-  // Comprobar que todos los movimientos internos van en la misma dirección
+  const change = (recent[recent.length - 1] - recent[0]) / recent[0];
   let monotonic = true;
   for (let i = 1; i < recent.length; i++) {
     if (change > 0 && recent[i] < recent[i - 1]) { monotonic = false; break; }
     if (change < 0 && recent[i] > recent[i - 1]) { monotonic = false; break; }
   }
-
   return monotonic && Math.abs(change) > CONFIG.TREND_THRESHOLD;
 }
 
-// ─── FIX 2: MATEMÁTICA SELL_PROXY CORRECTA ────────────────────
-//
-// En Polymarket NO existe venta en corto.
-// Cuando detectamos z > 0 (YES anormalmente caro), la operación correcta es:
-//   → Comprar NO a precio_NO = 1 - precio_YES
-//
-// Ejemplo concreto:
-//   YES = 0.70 (anormalmente alto, z = +2.1)
-//   Compramos NO a 0.30
-//   Si YES revierte a 0.55 → NO vale 0.45
-//   ROI = (0.45 - 0.30) / 0.30 = +50%
-//
-// El precio de entrada y salida que guardamos es el del NO (1 - YES).
-// El z-score sigue calculándose sobre el historial del YES para detectar
-// la anomalía, pero la posición vive en el espacio del NO.
-
+// ─── PRECIO NO ────────────────────────────────────────────────
 function noPrice(yesPrice) {
   return 1 - yesPrice;
 }
 
-// ─── LIQUIDEZ MÍNIMA ESCALADA POR PRECIO ─────────────────────
+// ─── LIQUIDEZ MÍNIMA ESCALADA ─────────────────────────────────
 function scaledMinLiq(price) {
   if (price < 0.10) return CONFIG.MIN_LIQ * 0.5;   // 10k
   if (price < 0.20) return CONFIG.MIN_LIQ * 0.75;  // 15k
   return CONFIG.MIN_LIQ;                             // 20k
 }
 
-// ─── TAKE PROFIT SEGÚN PRECIO DE ENTRADA ─────────────────────
-function takeProfitForEntry(entryPrice) {
-  return entryPrice < CONFIG.LOW_PRICE_THRESHOLD
-    ? CONFIG.LOW_PRICE_TP_ROI
-    : CONFIG.TAKE_PROFIT_ROI;
+// ─── TP AJUSTADO POR PRECIO YES ───────────────────────────────
+// Si YES está muy alto (ej. 0.90), el NO está a 0.10 y tiene
+// poco recorrido relativo. Reducimos el TP para ser más realistas.
+function adjustedTP(botTP, yesPrice) {
+  if (yesPrice > CONFIG.HIGH_PRICE_THRESHOLD) {
+    return botTP * CONFIG.HIGH_PRICE_TP_FACTOR;
+  }
+  return botTP;
 }
 
 // ─── COOLDOWN ─────────────────────────────────────────────────
@@ -321,31 +305,16 @@ function setCooldown(slug) {
 }
 
 // ─── CIERRE DE POSICIÓN ───────────────────────────────────────
-// FIX 2 aplicado aquí: el PnL de BUY y SELL_PROXY se calcula
-// sobre el precio real de compra (YES para BUY, NO para SELL_PROXY).
+// Toda posición es SELL_PROXY = compramos NO.
+// pos.entry = precio del NO en apertura = 1 - YES_apertura
+// exitPrice = precio del NO al cierre   = 1 - YES_cierre
 async function closePosition(pos, currentYesPrice, reason) {
-  let exitPrice, roi, gross, fee, pnl, netReturn;
-
-  if (pos.direction === "BUY") {
-    // Compramos YES. Ganamos cuando YES sube.
-    exitPrice = currentYesPrice;
-    roi       = (exitPrice - pos.entry) / pos.entry;
-    gross     = pos.shares * exitPrice;
-    fee       = gross * CONFIG.FEE_RATE;
-    pnl       = gross - fee - pos.invested;
-    netReturn = pos.invested + pnl;
-
-  } else {
-    // SELL_PROXY = compramos NO.
-    // pos.entry ya es el precio del NO en el momento de apertura.
-    // currentYesPrice → precio actual del YES → NO = 1 - YES
-    exitPrice = noPrice(currentYesPrice);  // precio actual del NO
-    roi       = (exitPrice - pos.entry) / pos.entry;
-    gross     = pos.shares * exitPrice;
-    fee       = gross * CONFIG.FEE_RATE;
-    pnl       = gross - fee - pos.invested;
-    netReturn = pos.invested + pnl;
-  }
+  const exitPrice = noPrice(currentYesPrice);
+  const roi       = (exitPrice - pos.entry) / pos.entry;
+  const gross     = pos.shares * exitPrice;
+  const fee       = gross * CONFIG.FEE_RATE;
+  const pnl       = gross - fee - pos.invested;
+  const netReturn = pos.invested + pnl;
 
   state.equity[pos.bot] += netReturn;
   state.peak[pos.bot]    = Math.max(state.peak[pos.bot], state.equity[pos.bot]);
@@ -353,13 +322,12 @@ async function closePosition(pos, currentYesPrice, reason) {
 
   if (reason === "STOP_LOSS") setCooldown(pos.slug);
 
-  // Guardamos el exitPrice en el espacio real de la posición (NO o YES)
   await dbInsertTrade(pos, exitPrice, pnl, roi, reason);
 
   state.closed.push({ ...pos, exit: exitPrice, pnl, roi, reason, closeTime: Date.now() });
   state.positions = state.positions.filter(p => p !== pos);
 
-  log(`◆ CLOSE [${pos.bot}] ${pos.slug} ${pos.direction} ${reason} roi=${(roi * 100).toFixed(1)}% pnl=${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}`, "TRADE");
+  log(`◆ CLOSE [${pos.bot}] ${pos.slug} ${reason} roi=${(roi * 100).toFixed(1)}% pnl=${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}`, "TRADE");
 }
 
 // ─── GESTIÓN DE POSICIONES ABIERTAS ──────────────────────────
@@ -370,21 +338,15 @@ async function managePositions(markets) {
     if (!market) continue;
 
     const currentYesPrice = market.price;
+    const currentNOPrice  = noPrice(currentYesPrice);
+    const roi             = (currentNOPrice - pos.entry) / pos.entry;
 
-    // ROI calculado sobre el precio real de compra
-    let roi;
-    if (pos.direction === "BUY") {
-      roi = (currentYesPrice - pos.entry) / pos.entry;
-    } else {
-      // pos.entry = precio del NO en apertura
-      // noPrice(currentYesPrice) = precio actual del NO
-      roi = (noPrice(currentYesPrice) - pos.entry) / pos.entry;
-    }
+    const botCfg = BOTS[pos.bot];
+    const tp     = adjustedTP(botCfg.TAKE_PROFIT_ROI, pos.yesAtEntry);
+    const sl     = botCfg.STOP_LOSS_ROI;
 
-    const tp = takeProfitForEntry(pos.entry);
-
-    if      (roi <= CONFIG.STOP_LOSS_ROI)     await closePosition(pos, currentYesPrice, "STOP_LOSS");
-    else if (roi >= tp)                        await closePosition(pos, currentYesPrice, "TAKE_PROFIT");
+    if      (roi <= sl)                              await closePosition(pos, currentYesPrice, "STOP_LOSS");
+    else if (roi >= tp)                              await closePosition(pos, currentYesPrice, "TAKE_PROFIT");
     else if (now - pos.opened >= CONFIG.MAX_HOLD_MS) await closePosition(pos, currentYesPrice, "TIMEOUT");
   }
 }
@@ -392,55 +354,45 @@ async function managePositions(markets) {
 // ─── SEÑALES DE ENTRADA ───────────────────────────────────────
 async function findSignals(markets) {
   const signals    = [];
-  const auditEntry = { ts: Date.now(), cycle: state.cycle, details: [], wouldHaveTP: 0, wouldHaveSignal: 0 };
+  const auditEntry = {
+    ts:               Date.now(),
+    cycle:            state.cycle,
+    details:          [],
+    wouldHaveSignal:  0,
+    wouldHaveTP:      0,
+  };
 
   for (const market of markets) {
     const { slug, price: yesPrice, volume24h, liquidity } = market;
 
     // ── Filtros de calidad ──────────────────────────────────
     if (yesPrice < CONFIG.PRICE_MIN || yesPrice > CONFIG.PRICE_MAX) continue;
-    if (volume24h < CONFIG.MIN_VOLUME_24H)       continue;
-    if (liquidity < scaledMinLiq(yesPrice))      continue;
+    if (volume24h < CONFIG.MIN_VOLUME_24H)   continue;
+    if (liquidity < scaledMinLiq(yesPrice))  continue;
 
     // ── Historial suficiente ────────────────────────────────
     const hist = state.history[slug];
     if (!hist || hist.length < CONFIG.MIN_HIST_CYCLES) continue;
 
-    // ── FIX 1: rechazar si hay tendencia sostenida ──────────
+    // ── Solo nos interesan señales alcistas en YES (z > 0)
+    // porque solo operamos SELL_PROXY (compramos NO)
+    const z = zScore(hist);
+    if (z <= 0) continue;  // precio bajo → no es nuestra señal
+
+    // ── Filtro de tendencia ─────────────────────────────────
     if (isActiveTrend(hist)) {
-      auditEntry.details.push({ slug, rejected: "TREND" });
+      auditEntry.details.push({ slug, z: z.toFixed(2), rejected: "TREND" });
       continue;
     }
 
-    // ── Z-score sobre historial de YES ──────────────────────
-    const z    = zScore(hist);
-    const absZ = Math.abs(z);
+    // ── ROI potencial del NO ────────────────────────────────
+    // Si YES revierte a la media, NO sube de (1-YES) a (1-media)
+    const histMean   = mean(hist.slice(0, -1));
+    const entryNO    = noPrice(yesPrice);
+    const exitNO     = noPrice(histMean);
+    const potentialRoi = (exitNO - entryNO) / entryNO;
 
-    // ── Dirección ───────────────────────────────────────────
-    // z > 0 → YES caro → compramos NO (SELL_PROXY)
-    // z < 0 → YES barato → compramos YES (BUY)
-    const direction = z > 0 ? "SELL_PROXY" : "BUY";
-
-    // ── Precio real de entrada según dirección ───────────────
-    // FIX 2: para SELL_PROXY guardamos el precio del NO, no del YES
-    const entryPrice = direction === "SELL_PROXY" ? noPrice(yesPrice) : yesPrice;
-
-    // ── ROI potencial ────────────────────────────────────────
-    // La media histórica del YES es nuestro objetivo de reversión
-    const histMean = mean(hist.slice(0, -1));
-    let potentialRoi;
-    if (direction === "BUY") {
-      // Compramos YES barato, esperamos que suba a la media
-      potentialRoi = (histMean - yesPrice) / yesPrice;
-    } else {
-      // Compramos NO = (1-YES), esperamos que YES baje a la media
-      // → NO sube de (1-yesPrice) a (1-histMean)
-      const entryNO = noPrice(yesPrice);
-      const exitNO  = noPrice(histMean);
-      potentialRoi  = (exitNO - entryNO) / entryNO;
-    }
-
-    if (potentialRoi <= 0) continue;  // sin potencial positivo, ignorar
+    if (potentialRoi <= 0) continue;
     if (potentialRoi > 0.20) auditEntry.wouldHaveTP++;
 
     // ── Cooldown ────────────────────────────────────────────
@@ -457,10 +409,8 @@ async function findSignals(markets) {
     signals.push({
       slug,
       yesPrice,
-      entryPrice,    // precio real de compra (NO o YES)
+      entryPrice:   entryNO,
       z,
-      absZ,
-      direction,
       potentialRoi,
       volume24h,
       liquidity,
@@ -469,11 +419,10 @@ async function findSignals(markets) {
 
     if (potentialRoi > 0.30) {
       auditEntry.details.push({
+        slug,
         z:     z.toFixed(2),
         roi:   (potentialRoi * 100).toFixed(0) + "%",
-        slug,
-        entry: entryPrice.toFixed(3),
-        dir:   direction,
+        entry: entryNO.toFixed(3),
       });
     }
   }
@@ -481,47 +430,45 @@ async function findSignals(markets) {
   state.auditLog.push(auditEntry);
   if (state.auditLog.length > 20) state.auditLog.shift();
 
-  // Ordenar por absZ descendente
-  return signals.sort((a, b) => b.absZ - a.absZ);
+  // Ordenar por z descendente — señal más fuerte primero
+  return signals.sort((a, b) => b.z - a.z);
 }
 
 // ─── APERTURA DE POSICIÓN ─────────────────────────────────────
 async function openPosition(bot, signal) {
-  const equity    = state.equity[bot];
-  const invested  = equity * CONFIG.RISK_PER_TRADE;
+  const equity     = state.equity[bot];
+  const invested   = equity * CONFIG.RISK_PER_TRADE;
   if (invested <= 0) return;
 
-  const feeEntry   = invested * CONFIG.FEE_RATE;
+  const feeEntry    = invested * CONFIG.FEE_RATE;
   const netInvested = invested - feeEntry;
-  // shares calculadas sobre el precio real de compra (NO o YES)
-  const shares     = netInvested / signal.entryPrice;
+  const shares      = netInvested / signal.entryPrice;
 
   const pos = {
     bot,
     slug:          signal.slug,
-    direction:     signal.direction,
-    entry:         signal.entryPrice,  // precio real (NO o YES)
-    yesAtEntry:    signal.yesPrice,    // guardamos YES original para referencia
+    direction:     "SELL_PROXY",
+    entry:         signal.entryPrice,   // precio del NO
+    yesAtEntry:    signal.yesPrice,     // YES original (para ajuste de TP)
     shares,
     invested,
     opened:        Date.now(),
     cycleOpened:   state.cycle,
-    expectedExit:  signal.direction === "SELL_PROXY"
-                     ? noPrice(signal.histMean)   // esperamos que NO suba hasta aquí
-                     : signal.histMean,            // esperamos que YES suba hasta aquí
+    expectedExit:  noPrice(signal.histMean),
     zScoreAtEntry: signal.z,
   };
 
   state.equity[bot] -= invested;
   state.positions.push(pos);
 
-  log(`◆ OPEN  [${bot}] ${signal.direction} ${signal.slug} entry=${signal.entryPrice.toFixed(3)} (YES=${signal.yesPrice.toFixed(3)}) z=${signal.z.toFixed(2)} potROI=${(signal.potentialRoi * 100).toFixed(0)}%`, "TRADE");
+  const botCfg = BOTS[bot];
+  log(`◆ OPEN  [${bot}/${botCfg.label}] SELL_PROXY ${signal.slug} NO=${signal.entryPrice.toFixed(3)} YES=${signal.yesPrice.toFixed(3)} z=${signal.z.toFixed(2)} potROI=${(signal.potentialRoi * 100).toFixed(0)}%`, "TRADE");
 }
 
 // ─── CICLO PRINCIPAL ──────────────────────────────────────────
 async function runCycle() {
   state.cycle++;
-  log(`─── Ciclo ${state.cycle} ───────────────────────────────────`);
+  log(`─── Ciclo ${state.cycle} ────────────────────────────────────`);
 
   // 1. Obtener mercados
   let rawMarkets;
@@ -532,7 +479,7 @@ async function runCycle() {
     return;
   }
 
-  // 2. Parsear y filtrar
+  // 2. Parsear
   const markets = rawMarkets
     .map(m => ({
       slug:      m.slug,
@@ -544,7 +491,7 @@ async function runCycle() {
 
   log(`Mercados: ${rawMarkets.length} total, ${markets.length} con precio válido`);
 
-  // 3. Actualizar historial (FIX 3: ventana de 24 ciclos)
+  // 3. Actualizar historial (ventana 24 ciclos)
   for (const m of markets) {
     if (!state.history[m.slug]) state.history[m.slug] = [];
     state.history[m.slug].push(m.price);
@@ -556,9 +503,14 @@ async function runCycle() {
   // 4. Gestionar posiciones abiertas
   await managePositions(markets);
 
-  // 5. Buscar señales
+  // 5. Buscar señales (solo SELL_PROXY)
   const signals = await findSignals(markets);
-  log(`Señales válidas: ${signals.length}`);
+  log(`Señales SELL_PROXY válidas: ${signals.length}`);
+  if (signals.length > 0) {
+    signals.slice(0, 5).forEach(s =>
+      log(`  ${s.slug} YES=${s.yesPrice.toFixed(3)} z=${s.z.toFixed(2)} potROI=${(s.potentialRoi * 100).toFixed(0)}%`)
+    );
+  }
 
   // 6. Asignar señales a bots
   for (const [botId, botCfg] of Object.entries(BOTS)) {
@@ -567,8 +519,9 @@ async function runCycle() {
 
     const slots = CONFIG.MAX_OPEN_PER_BOT - openCount;
 
+    // Cada bot filtra por su propio MIN_ZSCORE
     const validSignals = signals.filter(s =>
-      s.absZ >= botCfg.MIN_ZSCORE &&
+      s.z >= botCfg.MIN_ZSCORE &&
       !state.positions.some(p => p.bot === botId && p.slug === s.slug)
     );
 
@@ -578,10 +531,11 @@ async function runCycle() {
   }
 
   // 7. Resumen
-  for (const b of ["A", "B", "C"]) {
+  log(`─── Estado ──────────────────────────────────────────────`);
+  for (const [b, cfg] of Object.entries(BOTS)) {
     const open = state.positions.filter(p => p.bot === b).length;
     const pnl  = state.equity[b] - CONFIG.INITIAL_EQUITY;
-    log(`[${b}] equity=$${state.equity[b].toFixed(2)} pnl=${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} pos=${open} dd=${(state.dd[b] * 100).toFixed(2)}%`);
+    log(`[${b}/${cfg.label}] equity=$${state.equity[b].toFixed(2)} pnl=${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} pos=${open} dd=${(state.dd[b] * 100).toFixed(2)}% minZ=${cfg.MIN_ZSCORE} TP=${(cfg.TAKE_PROFIT_ROI * 100).toFixed(0)}%`);
   }
 
   // 8. Guardar
@@ -590,6 +544,11 @@ async function runCycle() {
 
 // ─── BUCLE ────────────────────────────────────────────────────
 async function main() {
+  log("🚀 DriftBot v5.0 — Solo SELL_PROXY, tres perfiles");
+  log(`   A/Base:        z>=${BOTS.A.MIN_ZSCORE} TP=${BOTS.A.TAKE_PROFIT_ROI*100}% SL=${Math.abs(BOTS.A.STOP_LOSS_ROI)*100}%`);
+  log(`   B/Selectivo:   z>=${BOTS.B.MIN_ZSCORE} TP=${BOTS.B.TAKE_PROFIT_ROI*100}% SL=${Math.abs(BOTS.B.STOP_LOSS_ROI)*100}%`);
+  log(`   C/Oportunista: z>=${BOTS.C.MIN_ZSCORE} TP=${BOTS.C.TAKE_PROFIT_ROI*100}% SL=${Math.abs(BOTS.C.STOP_LOSS_ROI)*100}%`);
+
   await loadState();
 
   async function loop() {
