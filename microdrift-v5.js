@@ -14,25 +14,30 @@ const CONFIG = {
 
   INITIAL_EQUITY: 200,
 
-  PRICE_MIN: 0.03,                    // ✅ CAMBIO: era 0.10
+  PRICE_MIN: 0.03,
   PRICE_MAX: 0.90,
   MIN_VOLUME_24H: 50_000,
   MIN_LIQ: 20_000,
 
+  // ✅ FIX 2: umbrales más bajos para mercados con señal fuerte (z muy alto)
+  MIN_VOLUME_24H_OVERRIDE: 20_000,
+  MIN_LIQ_OVERRIDE: 8_000,
+  ZSCORE_OVERRIDE_THRESHOLD: 2.5,
+
   RISK_PER_TRADE: 0.025,
   MAX_OPEN_PER_BOT: 2,
 
-  FEE_RATE: 0.005,                    // ✅ CAMBIO: era 0.02
+  FEE_RATE: 0.005,
 
   STOP_LOSS_ROI: -0.12,
   TAKE_PROFIT_ROI: 0.20,
-  MAX_HOLD_MS: 12 * 60 * 60 * 1000,   // ✅ CAMBIO: 12 horas (era 2 horas)
+  MAX_HOLD_MS: 12 * 60 * 60 * 1000,
 
   CYCLE_INTERVAL_MS: 60 * 60 * 1000,
 
-  HISTORY_WINDOW: 12,                 // ✅ CAMBIO: era 6
+  HISTORY_WINDOW: 12,
   REVERSION_THRESHOLD: 1.8,
-  MIN_HIST_CYCLES: 6,                 // ✅ CAMBIO: era 3
+  MIN_HIST_CYCLES: 6,
 };
 
 const BOTS = {
@@ -153,14 +158,12 @@ async function loadState() {
     if (rejHist   !== null) state.rejectedHistory = rejHist;
     if (auditLog  !== null) state.auditLog        = auditLog;
 
-    // ── DIAGNÓSTICO DE BUY ──────────────────────────────
-    const buyTrades = state.closed.filter(t => t.direction === "BUY");
+    const buyTrades    = state.closed.filter(t => t.direction === "BUY");
     const buyPositions = state.positions.filter(p => p.direction === "BUY");
     if (buyTrades.length > 0 || buyPositions.length > 0) {
       log(`⚠️ DIAGNÓSTICO: BUY cerrados = ${buyTrades.length}, BUY abiertos = ${buyPositions.length}`, "WARN");
     }
 
-    // ── Recalcular equity real desde tabla trades ──────
     try {
       const allTrades = await sbFetch("/trades?select=bot,invested,pnl");
       if (allTrades && allTrades.length > 0) {
@@ -258,13 +261,19 @@ function extractBestPrice(m) {
   }
 }
 
-function filterMarkets(markets) {
+// ✅ FIX 2: filterMarkets con bypass para z-score muy alto
+function filterMarkets(markets, signalOverrideSlugs = new Set()) {
   const rejected = { price: 0, volume: 0, liquidity: 0 };
   const valid = [];
   for (const m of markets) {
-    if (m.price < CONFIG.PRICE_MIN || m.price > CONFIG.PRICE_MAX) { rejected.price++;    continue; }
-    if (m.volume24h < CONFIG.MIN_VOLUME_24H)                       { rejected.volume++;   continue; }
-    if (m.liquidity < CONFIG.MIN_LIQ)                              { rejected.liquidity++; continue; }
+    if (m.price < CONFIG.PRICE_MIN || m.price > CONFIG.PRICE_MAX) { rejected.price++;     continue; }
+
+    const isOverride = signalOverrideSlugs.has(m.slug);
+    const volMin  = isOverride ? CONFIG.MIN_VOLUME_24H_OVERRIDE : CONFIG.MIN_VOLUME_24H;
+    const liqMin  = isOverride ? CONFIG.MIN_LIQ_OVERRIDE        : CONFIG.MIN_LIQ;
+
+    if (m.volume24h < volMin) { rejected.volume++;    continue; }
+    if (m.liquidity < liqMin) { rejected.liquidity++; continue; }
     valid.push(m);
   }
   return { valid, rejected };
@@ -366,12 +375,12 @@ async function managePositions(markets) {
     const eff = pos.direction === "SELL_PROXY" ? 1 - raw : raw;
     const roi = (eff - pos.entry) / pos.entry;
 
-    if (roi <= CONFIG.STOP_LOSS_ROI)                        { await closePosition(pos, eff, "STOP_LOSS");         continue; }
-    if (roi >= CONFIG.TAKE_PROFIT_ROI)                      { await closePosition(pos, eff, "TAKE_PROFIT");       continue; }
-    if (now - pos.opened > CONFIG.MAX_HOLD_MS)              { await closePosition(pos, eff, "TIMEOUT");           continue; }
+    if (roi <= CONFIG.STOP_LOSS_ROI)               { await closePosition(pos, eff, "STOP_LOSS");         continue; }
+    if (roi >= CONFIG.TAKE_PROFIT_ROI)             { await closePosition(pos, eff, "TAKE_PROFIT");       continue; }
+    if (now - pos.opened > CONFIG.MAX_HOLD_MS)     { await closePosition(pos, eff, "TIMEOUT");           continue; }
 
     const progress = Math.abs(eff - pos.entry) / Math.abs(pos.expectedExit - pos.entry);
-    if (progress > 0.6 && roi > 0.05)                       { await closePosition(pos, eff, "PARTIAL_REVERSION"); continue; }
+    if (progress > 0.6 && roi > 0.05)             { await closePosition(pos, eff, "PARTIAL_REVERSION"); continue; }
   }
 }
 
@@ -466,7 +475,23 @@ async function runCycle() {
 
     await managePositions(allMarkets);
 
-    const { valid, rejected } = filterMarkets(allMarkets);
+    // ✅ FIX 2: detectar slugs con z-score muy alto en rejectedHistory
+    //    para bajarles el umbral de vol/liq y que puedan entrar al valid pool
+    const signalOverrideSlugs = new Set();
+    if (state.rejectedHistory) {
+      for (const [slug, hist] of Object.entries(state.rejectedHistory)) {
+        if (hist.length < CONFIG.MIN_HIST_CYCLES) continue;
+        const prices = hist.map(h => h.price);
+        const mean   = prices.reduce((s, p) => s + p, 0) / prices.length;
+        const std    = Math.sqrt(prices.reduce((s, p) => s + (p - mean) ** 2, 0) / (prices.length - 1));
+        if (std < 0.005) continue;
+        const z = (prices[prices.length - 1] - mean) / std;
+        if (Math.abs(z) >= CONFIG.ZSCORE_OVERRIDE_THRESHOLD) signalOverrideSlugs.add(slug);
+      }
+      if (signalOverrideSlugs.size > 0) log(`Override vol/liq para ${signalOverrideSlugs.size} slugs con z≥${CONFIG.ZSCORE_OVERRIDE_THRESHOLD}`);
+    }
+
+    const { valid, rejected } = filterMarkets(allMarkets, signalOverrideSlugs);
     rejected._validSlugs = new Set(valid.map(m => m.slug));
 
     updateHistory(valid);
@@ -475,14 +500,21 @@ async function runCycle() {
       .map(m => ({ ...m, signal: computeSignal(m) }))
       .filter(m => m.signal);
 
-    const usedSlugs = new Set(state.positions.map(p => p.slug));
+    // ✅ FIX 1: cada bot usa sus propios slugs abiertos, no un set global compartido
     for (const [bot, botConfig] of Object.entries(BOTS)) {
+      const botOpenSlugs = new Set(state.positions.filter(p => p.bot === bot).map(p => p.slug));
       const eligible = candidates
-        .filter(c => !usedSlugs.has(c.slug) && c.signal.absZScore >= botConfig.MIN_ZSCORE && state.equity[bot] > 10)
+        .filter(c => !botOpenSlugs.has(c.slug) && c.signal.absZScore >= botConfig.MIN_ZSCORE && state.equity[bot] > 10)
         .sort((a, b) => b.signal.qualScore - a.signal.qualScore);
       if (!eligible.length) continue;
-      openPosition(bot, eligible[0], eligible[0].signal);
-      usedSlugs.add(eligible[0].slug);
+
+      // Abrir hasta MAX_OPEN_PER_BOT posiciones por ciclo
+      for (const candidate of eligible) {
+        if (state.positions.filter(p => p.bot === bot).length >= CONFIG.MAX_OPEN_PER_BOT) break;
+        if (botOpenSlugs.has(candidate.slug)) continue;
+        openPosition(bot, candidate, candidate.signal);
+        botOpenSlugs.add(candidate.slug);
+      }
     }
 
     auditRejected(rejected, allMarkets);
@@ -506,7 +538,7 @@ async function scheduler() {
 
 // ─── ARRANQUE ─────────────────────────────────────────────────
 log("════════════════════════════════════════════════════════════");
-log("MICRODRIFT v5.6 — Supabase Edition (timeout 12h, history 12, fee 0.5%, price_min 0.03)");
+log("MICRODRIFT v5.7 — Fix: usedSlugs por bot + override vol/liq");
 log(`Supabase: ${SUPABASE_URL}`);
 log(`Capital: $${CONFIG.INITIAL_EQUITY} × 3 bots = $${CONFIG.INITIAL_EQUITY * 3} total`);
 log(`Timeout: ${CONFIG.MAX_HOLD_MS/60_000}m | Stop: ${CONFIG.STOP_LOSS_ROI*100}% | TP: ${CONFIG.TAKE_PROFIT_ROI*100}%`);
@@ -527,13 +559,13 @@ const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   const totalPnl = state.closed.reduce((s, t) => s + t.pnl, 0);
   const body = JSON.stringify({
-    status:  "running",
-    cycle:   state.cycle,
-    equity:  state.equity,
-    trades:  state.closed.length,
-    pnl:     totalPnl.toFixed(2),
+    status:    "running",
+    cycle:     state.cycle,
+    equity:    state.equity,
+    trades:    state.closed.length,
+    pnl:       totalPnl.toFixed(2),
     positions: state.positions.length,
-    uptime:  Math.round(process.uptime()) + "s",
+    uptime:    Math.round(process.uptime()) + "s",
   }, null, 2);
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(body);
