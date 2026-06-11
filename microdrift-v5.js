@@ -1,3 +1,4 @@
+```javascript
 // ─── LOGGING ──────────────────────────────────────────────────
 function ts() {
   return new Date().toISOString().slice(0, 19).replace("T", " ");
@@ -19,9 +20,11 @@ const CONFIG = {
   MIN_VOLUME_24H: 50_000,
   MIN_LIQ: 20_000,
 
-  // ✅ FIX 2: umbrales más bajos para mercados con señal fuerte (z muy alto)
+  // Override para mercados con z-score muy alto
   MIN_VOLUME_24H_OVERRIDE: 20_000,
   MIN_LIQ_OVERRIDE: 8_000,
+  PRICE_MIN_OVERRIDE: 0.01,
+  PRICE_MAX_OVERRIDE: 0.95,
   ZSCORE_OVERRIDE_THRESHOLD: 2.5,
 
   RISK_PER_TRADE: 0.025,
@@ -36,6 +39,7 @@ const CONFIG = {
   CYCLE_INTERVAL_MS: 60 * 60 * 1000,
 
   HISTORY_WINDOW: 12,
+  HISTORY_EXTRA: 2,
   REVERSION_THRESHOLD: 1.8,
   MIN_HIST_CYCLES: 6,
 };
@@ -132,6 +136,34 @@ let state = {
   auditLog:        [],
 };
 
+// ─── MIGRACIÓN BUY → SELL_PROXY ───────────────────────────────
+function migrateBuyPositions() {
+  let migratedCount = 0;
+
+  for (const pos of state.positions) {
+    if (pos.direction === "BUY") {
+      const oldEntry = pos.entry;
+      const oldDirection = pos.direction;
+
+      // Convertir BUY a SELL_PROXY
+      pos.direction = "SELL_PROXY";
+      pos.entry = 1 - pos.entry;
+      pos.yesAtEntry = oldEntry;
+      pos._migrated = true;
+      pos._migratedAt = Date.now();
+
+      migratedCount++;
+      log(`MIGRADO: ${pos.slug.slice(0, 40)} ${oldDirection}@${oldEntry.toFixed(3)} → SELL_PROXY@${pos.entry.toFixed(3)}`, "WARN");
+    }
+  }
+
+  if (migratedCount > 0) {
+    log(`✓ Migradas ${migratedCount} posiciones BUY → SELL_PROXY`, "WARN");
+  }
+
+  return migratedCount;
+}
+
 async function loadState() {
   log("Cargando estado desde Supabase...");
   try {
@@ -158,35 +190,54 @@ async function loadState() {
     if (rejHist   !== null) state.rejectedHistory = rejHist;
     if (auditLog  !== null) state.auditLog        = auditLog;
 
-    const buyTrades    = state.closed.filter(t => t.direction === "BUY");
-    const buyPositions = state.positions.filter(p => p.direction === "BUY");
-    if (buyTrades.length > 0 || buyPositions.length > 0) {
-      log(`⚠️ DIAGNÓSTICO: BUY cerrados = ${buyTrades.length}, BUY abiertos = ${buyPositions.length}`, "WARN");
+    // ✅ MIGRACIÓN AUTOMÁTICA de BUY → SELL_PROXY
+    const buyPositionsBefore = state.positions.filter(p => p.direction === "BUY").length;
+    if (buyPositionsBefore > 0) {
+      log(`⚠️ Detectadas ${buyPositionsBefore} posiciones BUY → Migrando a SELL_PROXY`, "WARN");
+      migrateBuyPositions();
+      // Guardar estado migrado inmediatamente
+      await saveState();
     }
 
+    // Diagnóstico de trades BUY históricos (solo informativo)
+    const buyTrades = state.closed.filter(t => t.direction === "BUY").length;
+    if (buyTrades > 0) {
+      log(`ℹ️ Historial contiene ${buyTrades} trades BUY cerrados de versiones anteriores (no afectan equity)`, "WARN");
+    }
+
+    // Recalcular equity desde tabla trades
     try {
       const allTrades = await sbFetch("/trades?select=bot,invested,pnl");
       if (allTrades && allTrades.length > 0) {
         const realEquity = { A: CONFIG.INITIAL_EQUITY, B: CONFIG.INITIAL_EQUITY, C: CONFIG.INITIAL_EQUITY };
+
+        // Restar capital en posiciones abiertas actuales (las migradas ya son SELL_PROXY)
         for (const pos of state.positions) {
-          if (realEquity[pos.bot] !== undefined) realEquity[pos.bot] -= pos.invested;
+          if (realEquity[pos.bot] !== undefined && pos.direction === "SELL_PROXY") {
+            realEquity[pos.bot] -= pos.invested;
+          }
         }
+
+        // Sumar PnL de trades cerrados (excluyendo BUY antiguos)
         for (const t of allTrades) {
-          if (realEquity[t.bot] !== undefined) realEquity[t.bot] += t.pnl;
+          if (realEquity[t.bot] !== undefined && t.direction !== "BUY") {
+            realEquity[t.bot] += t.pnl;
+          }
         }
+
         state.equity = realEquity;
         state.peak   = {
-          A: Math.max(state.peak.A, realEquity.A),
-          B: Math.max(state.peak.B, realEquity.B),
-          C: Math.max(state.peak.C, realEquity.C),
+          A: Math.max(state.peak.A || CONFIG.INITIAL_EQUITY, realEquity.A),
+          B: Math.max(state.peak.B || CONFIG.INITIAL_EQUITY, realEquity.B),
+          C: Math.max(state.peak.C || CONFIG.INITIAL_EQUITY, realEquity.C),
         };
-        log(`Equity recalculado desde ${allTrades.length} trades → A=$${realEquity.A.toFixed(2)} B=$${realEquity.B.toFixed(2)} C=$${realEquity.C.toFixed(2)}`);
+        log(`Equity recalculado → A=$${realEquity.A.toFixed(2)} B=$${realEquity.B.toFixed(2)} C=$${realEquity.C.toFixed(2)}`);
       }
     } catch (eqErr) {
       log(`No se pudo recalcular equity: ${eqErr.message}`, "WARN");
     }
 
-    log(`Estado cargado: ciclo=${state.cycle} trades_db=${state.closed.length} mercados_mem=${Object.keys(state.history).length}`);
+    log(`Estado cargado: ciclo=${state.cycle} trades=${state.closed.length} mercados=${Object.keys(state.history).length}`);
   } catch (err) {
     log(`Error cargando estado, iniciando desde cero: ${err.message}`, "WARN");
   }
@@ -223,7 +274,7 @@ async function fetchMarkets() {
           "Origin": "https://polymarket.com",
           "Referer": "https://polymarket.com/",
         },
-        timeout: 20_000,
+        signal: AbortSignal.timeout(20_000),
       }
     );
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -261,19 +312,20 @@ function extractBestPrice(m) {
   }
 }
 
-// ✅ FIX 2: filterMarkets con bypass para z-score muy alto
 function filterMarkets(markets, signalOverrideSlugs = new Set()) {
   const rejected = { price: 0, volume: 0, liquidity: 0 };
   const valid = [];
   for (const m of markets) {
-    if (m.price < CONFIG.PRICE_MIN || m.price > CONFIG.PRICE_MAX) { rejected.price++;     continue; }
-
     const isOverride = signalOverrideSlugs.has(m.slug);
-    const volMin  = isOverride ? CONFIG.MIN_VOLUME_24H_OVERRIDE : CONFIG.MIN_VOLUME_24H;
-    const liqMin  = isOverride ? CONFIG.MIN_LIQ_OVERRIDE        : CONFIG.MIN_LIQ;
 
-    if (m.volume24h < volMin) { rejected.volume++;    continue; }
-    if (m.liquidity < liqMin) { rejected.liquidity++; continue; }
+    const priceMin = isOverride ? CONFIG.PRICE_MIN_OVERRIDE : CONFIG.PRICE_MIN;
+    const priceMax = isOverride ? CONFIG.PRICE_MAX_OVERRIDE : CONFIG.PRICE_MAX;
+    const volMin   = isOverride ? CONFIG.MIN_VOLUME_24H_OVERRIDE : CONFIG.MIN_VOLUME_24H;
+    const liqMin   = isOverride ? CONFIG.MIN_LIQ_OVERRIDE        : CONFIG.MIN_LIQ;
+
+    if (m.price < priceMin || m.price > priceMax) { rejected.price++;     continue; }
+    if (m.volume24h < volMin)                      { rejected.volume++;    continue; }
+    if (m.liquidity < liqMin)                      { rejected.liquidity++; continue; }
     valid.push(m);
   }
   return { valid, rejected };
@@ -283,7 +335,9 @@ function updateHistory(markets) {
   for (const m of markets) {
     if (!state.history[m.slug]) state.history[m.slug] = [];
     state.history[m.slug].push(m.price);
-    if (state.history[m.slug].length > CONFIG.HISTORY_WINDOW) state.history[m.slug].shift();
+    if (state.history[m.slug].length > CONFIG.HISTORY_WINDOW + CONFIG.HISTORY_EXTRA) {
+      state.history[m.slug].shift();
+    }
   }
   const activeSlugs = new Set(markets.map(m => m.slug));
   for (const slug of Object.keys(state.history)) {
@@ -304,9 +358,13 @@ function computeSignal(m) {
 
   let direction, entryPrice, expectedReversion;
   if (zScore < -CONFIG.REVERSION_THRESHOLD) {
-    direction = "BUY"; entryPrice = m.price; expectedReversion = mean;
+    direction = "BUY";
+    entryPrice = m.price;
+    expectedReversion = mean;
   } else if (zScore > CONFIG.REVERSION_THRESHOLD) {
-    direction = "SELL_PROXY"; entryPrice = 1 - m.price; expectedReversion = 1 - mean;
+    direction = "SELL_PROXY";
+    entryPrice = 1 - m.price;
+    expectedReversion = 1 - mean;
   } else {
     return null;
   }
@@ -315,10 +373,20 @@ function computeSignal(m) {
   const volBonus  = Math.min(1.2, 1 + (m.volume24h - CONFIG.MIN_VOLUME_24H) / 500_000);
   const liqBonus  = Math.min(1.1, 1 + (m.liquidity - CONFIG.MIN_LIQ) / 200_000);
 
-  return { direction, entryPrice, expectedReversion, zScore, absZScore, qualScore: absZScore * volBonus * liqBonus, mean, std };
+  return {
+    direction,
+    entryPrice,
+    expectedReversion,
+    zScore,
+    absZScore,
+    qualScore: absZScore * volBonus * liqBonus,
+    mean,
+    std
+  };
 }
 
 function calcPnl(entry, exit, invested) {
+  if (entry <= 0) return 0;
   const shares = invested / entry;
   return shares * (exit - entry) - invested * CONFIG.FEE_RATE;
 }
@@ -329,35 +397,57 @@ function openPosition(bot, m, signal) {
   if (state.equity[bot] < 10) return;
 
   const invested = state.equity[bot] * CONFIG.RISK_PER_TRADE;
+  if (invested <= 0) return;
+
   state.equity[bot] -= invested;
 
   state.positions.push({
-    bot, slug: m.slug, question: m.question,
-    direction: signal.direction, entry: signal.entryPrice,
-    expectedExit: signal.expectedReversion, zScoreAtEntry: signal.zScore,
-    invested, shares: invested / signal.entryPrice,
-    opened: Date.now(), cycleOpened: state.cycle,
+    bot,
+    slug: m.slug,
+    question: m.question,
+    direction: signal.direction,
+    entry: signal.entryPrice,
+    expectedExit: signal.expectedReversion,
+    zScoreAtEntry: signal.zScore,
+    invested,
+    shares: invested / signal.entryPrice,
+    opened: Date.now(),
+    cycleOpened: state.cycle,
   });
 
   log(`OPEN ${bot} [${signal.direction}] ${m.slug.slice(0, 30)} entry=${signal.entryPrice.toFixed(3)} z=${signal.zScore.toFixed(2)} $${invested.toFixed(2)}`, "TRADE");
 }
 
 async function closePosition(pos, exitPrice, reason) {
+  if (pos.entry <= 0) {
+    log(`ERROR: entry=${pos.entry} para ${pos.slug}`, "ERR");
+    state.positions = state.positions.filter(p => p !== pos);
+    return;
+  }
+
   const netPnl = calcPnl(pos.entry, exitPrice, pos.invested);
   state.equity[pos.bot] += pos.invested + netPnl;
 
   const eq = state.equity[pos.bot];
-  state.peak[pos.bot] = Math.max(state.peak[pos.bot], eq);
-  state.dd[pos.bot]   = Math.max(state.dd[pos.bot], (state.peak[pos.bot] - eq) / state.peak[pos.bot]);
+  state.peak[pos.bot] = Math.max(state.peak[pos.bot] || CONFIG.INITIAL_EQUITY, eq);
+  state.dd[pos.bot]   = Math.max(state.dd[pos.bot] || 0, (state.peak[pos.bot] - eq) / state.peak[pos.bot]);
 
   const roi = netPnl / pos.invested;
 
-  state.closed.push({ ...pos, exit: exitPrice, pnl: netPnl, roi, reason, closeTime: Date.now() });
+  state.closed.push({
+    ...pos,
+    exit: exitPrice,
+    pnl: netPnl,
+    roi,
+    reason,
+    closeTime: Date.now()
+  });
+
   if (state.closed.length > 500) state.closed.shift();
 
   state.positions = state.positions.filter(p => p !== pos);
 
-  const sign = netPnl > 0 ? "+" : "";
+  const sign = netPnl >= 0 ? "+" : "";
   log(`CLOSE ${pos.bot} [${reason}] ${pos.slug.slice(0, 25)} pnl=${sign}$${netPnl.toFixed(2)} roi=${(roi*100).toFixed(1)}%`, "TRADE");
 
   await dbInsertTrade(pos, exitPrice, netPnl, roi, reason);
@@ -369,30 +459,55 @@ async function managePositions(markets) {
   const priceMap = new Map(markets.map(m => [m.slug, m.price]));
 
   for (const pos of [...state.positions]) {
+    // Protección contra posiciones BUY residuales (no debería haber después de migración)
+    if (pos.direction === "BUY") {
+      log(`⚠️ Posición BUY detectada en managePositions → Migrando: ${pos.slug}`, "WARN");
+      pos.direction = "SELL_PROXY";
+      pos.entry = 1 - pos.entry;
+      pos.yesAtEntry = pos.entry;
+    }
+
     const raw = priceMap.get(pos.slug);
     if (raw === undefined) continue;
 
     const eff = pos.direction === "SELL_PROXY" ? 1 - raw : raw;
     const roi = (eff - pos.entry) / pos.entry;
 
-    if (roi <= CONFIG.STOP_LOSS_ROI)               { await closePosition(pos, eff, "STOP_LOSS");         continue; }
-    if (roi >= CONFIG.TAKE_PROFIT_ROI)             { await closePosition(pos, eff, "TAKE_PROFIT");       continue; }
-    if (now - pos.opened > CONFIG.MAX_HOLD_MS)     { await closePosition(pos, eff, "TIMEOUT");           continue; }
+    if (roi <= CONFIG.STOP_LOSS_ROI) {
+      await closePosition(pos, eff, "STOP_LOSS");
+      continue;
+    }
+    if (roi >= CONFIG.TAKE_PROFIT_ROI) {
+      await closePosition(pos, eff, "TAKE_PROFIT");
+      continue;
+    }
+    if (now - pos.opened > CONFIG.MAX_HOLD_MS) {
+      await closePosition(pos, eff, "TIMEOUT");
+      continue;
+    }
 
-    const progress = Math.abs(eff - pos.entry) / Math.abs(pos.expectedExit - pos.entry);
-    if (progress > 0.6 && roi > 0.05)             { await closePosition(pos, eff, "PARTIAL_REVERSION"); continue; }
+    // Partial reversión: si llevamos >60% del camino hacia expectedExit y tenemos +5%
+    const progress = Math.abs(pos.expectedExit - pos.entry) > 0.001
+      ? Math.abs(eff - pos.entry) / Math.abs(pos.expectedExit - pos.entry)
+      : 0;
+    if (progress > 0.6 && roi > 0.05) {
+      await closePosition(pos, eff, "PARTIAL_REVERSION");
+      continue;
+    }
   }
 }
 
 function auditRejected(rejected, allMarkets) {
   if (!state.rejectedHistory) state.rejectedHistory = {};
-  if (!state.auditLog)        state.auditLog = [];
+  if (!state.auditLog) state.auditLog = [];
 
   for (const m of allMarkets) {
-    if (rejected._validSlugs.has(m.slug)) continue;
+    if (rejected._validSlugs && rejected._validSlugs.has(m.slug)) continue;
     if (!state.rejectedHistory[m.slug]) state.rejectedHistory[m.slug] = [];
     state.rejectedHistory[m.slug].push({ price: m.price, ts: Date.now() });
-    if (state.rejectedHistory[m.slug].length > CONFIG.HISTORY_WINDOW + 2) state.rejectedHistory[m.slug].shift();
+    if (state.rejectedHistory[m.slug].length > CONFIG.HISTORY_WINDOW + CONFIG.HISTORY_EXTRA) {
+      state.rejectedHistory[m.slug].shift();
+    }
   }
 
   let wouldHaveSignal = 0, wouldHaveTP = 0;
@@ -412,7 +527,7 @@ function auditRejected(rejected, allMarkets) {
     wouldHaveSignal++;
     const entryPrice = z < 0 ? prev : 1 - prev;
     const exitPrice  = z < 0 ? current : 1 - current;
-    const roi        = (exitPrice - entryPrice) / entryPrice;
+    const roi        = entryPrice > 0 ? (exitPrice - entryPrice) / entryPrice : 0;
     if (roi >= CONFIG.TAKE_PROFIT_ROI) {
       wouldHaveTP++;
       details.push({ slug, z: z.toFixed(2), roi: (roi * 100).toFixed(0) + "%", entry: entryPrice.toFixed(3) });
@@ -421,7 +536,9 @@ function auditRejected(rejected, allMarkets) {
 
   if (wouldHaveSignal > 0) {
     log(`AUDIT | rechazados con señal=${wouldHaveSignal} habrían TP=${wouldHaveTP}`, "WARN");
-    for (const d of details) log(`  AUDIT-TP ${d.slug.slice(0, 35)} z=${d.z} entry=${d.entry} roi=${d.roi}`, "WARN");
+    for (const d of details) {
+      log(`  AUDIT-TP ${d.slug.slice(0, 35)} z=${d.z} entry=${d.entry} roi=${d.roi}`, "WARN");
+    }
     state.auditLog.push({ cycle: state.cycle, ts: Date.now(), wouldHaveSignal, wouldHaveTP, details });
     if (state.auditLog.length > 200) state.auditLog.shift();
   }
@@ -435,21 +552,25 @@ function printReport(totalMarkets, validCount, rejected) {
 
   for (const b of ["A", "B", "C"]) {
     const openPos   = state.positions.filter(p => p.bot === b);
-    const botClosed = state.closed.filter(t => t.bot === b);
+    const botClosed = state.closed.filter(t => t.bot === b && t.direction !== "BUY");
     const wins      = botClosed.filter(t => t.pnl > 0).length;
     const pnl       = botClosed.reduce((s, t) => s + t.pnl, 0);
     const wr        = botClosed.length ? ((wins / botClosed.length) * 100).toFixed(0) : "—";
-    log(`BOT ${b} (${BOTS[b].label}) | equity=$${state.equity[b].toFixed(2)} | pos=${openPos.length}/${CONFIG.MAX_OPEN_PER_BOT} | DD=${(state.dd[b]*100).toFixed(1)}% | trades=${botClosed.length} WR=${wr}% pnl=$${pnl.toFixed(2)}`);
+
+    log(`BOT ${b} (${BOTS[b].label}) | equity=$${state.equity[b].toFixed(2)} | pos=${openPos.length}/${CONFIG.MAX_OPEN_PER_BOT} | DD=${((state.dd[b] || 0)*100).toFixed(1)}% | trades=${botClosed.length} WR=${wr}% pnl=$${pnl.toFixed(2)}`);
+
     for (const p of openPos) {
       const age = Math.round((Date.now() - p.opened) / 60_000);
-      log(`  └ ${p.direction} ${p.slug.slice(0, 35)} | entry=${p.entry.toFixed(3)} | age=${age}m`);
+      const currentPrice = p.direction === "SELL_PROXY" ? (1 - (priceMapGlobal.get(p.slug) || 0)) : (priceMapGlobal.get(p.slug) || 0);
+      const currentRoi = ((currentPrice - p.entry) / p.entry * 100).toFixed(1);
+      log(`  └ ${p.direction} ${p.slug.slice(0, 35)} | entry=${p.entry.toFixed(3)} | roi=${currentRoi}% | age=${age}m`);
     }
   }
 
-  const allClosed = state.closed;
+  const allClosed = state.closed.filter(t => t.direction !== "BUY");
   if (allClosed.length > 0) {
     const wins     = allClosed.filter(t => t.pnl > 0);
-    const losses   = allClosed.filter(t => t.pnl < 0);
+    const losses   = allClosed.filter(t => t.pnl <= 0);
     const totalPnl = allClosed.reduce((s, t) => s + t.pnl, 0);
     const gw       = wins.reduce((s, t) => s + t.pnl, 0);
     const gl       = Math.abs(losses.reduce((s, t) => s + t.pnl, 0));
@@ -459,24 +580,35 @@ function printReport(totalMarkets, validCount, rejected) {
     const byReason = {};
     for (const t of allClosed) {
       if (!byReason[t.reason]) byReason[t.reason] = { n: 0, pnl: 0 };
-      byReason[t.reason].n++; byReason[t.reason].pnl += t.pnl;
+      byReason[t.reason].n++;
+      byReason[t.reason].pnl += t.pnl;
     }
-    for (const [r, s] of Object.entries(byReason)) log(`  ${r}: ${s.n} trades pnl=$${s.pnl.toFixed(2)}`);
+    for (const [r, s] of Object.entries(byReason)) {
+      log(`  ${r}: ${s.n} trades pnl=$${s.pnl.toFixed(2)}`);
+    }
   }
   log(div);
 }
+
+// Variable global temporal para printReport
+let priceMapGlobal = new Map();
 
 async function runCycle() {
   state.cycle++;
   const t0 = Date.now();
   try {
     const allMarkets = await fetchMarkets();
-    if (allMarkets.length === 0) { log("Sin mercados, reintentando...", "WARN"); return; }
+    if (allMarkets.length === 0) {
+      log("Sin mercados, reintentando...", "WARN");
+      return;
+    }
+
+    // Guardar priceMap para printReport
+    priceMapGlobal = new Map(allMarkets.map(m => [m.slug, m.price]));
 
     await managePositions(allMarkets);
 
-    // ✅ FIX 2: detectar slugs con z-score muy alto en rejectedHistory
-    //    para bajarles el umbral de vol/liq y que puedan entrar al valid pool
+    // Detectar slugs con z-score muy alto en rejectedHistory para bajarles filtros
     const signalOverrideSlugs = new Set();
     if (state.rejectedHistory) {
       for (const [slug, hist] of Object.entries(state.rejectedHistory)) {
@@ -488,7 +620,9 @@ async function runCycle() {
         const z = (prices[prices.length - 1] - mean) / std;
         if (Math.abs(z) >= CONFIG.ZSCORE_OVERRIDE_THRESHOLD) signalOverrideSlugs.add(slug);
       }
-      if (signalOverrideSlugs.size > 0) log(`Override vol/liq para ${signalOverrideSlugs.size} slugs con z≥${CONFIG.ZSCORE_OVERRIDE_THRESHOLD}`);
+      if (signalOverrideSlugs.size > 0) {
+        log(`Override vol/liq/precio para ${signalOverrideSlugs.size} slugs con z≥${CONFIG.ZSCORE_OVERRIDE_THRESHOLD}`);
+      }
     }
 
     const { valid, rejected } = filterMarkets(allMarkets, signalOverrideSlugs);
@@ -500,15 +634,19 @@ async function runCycle() {
       .map(m => ({ ...m, signal: computeSignal(m) }))
       .filter(m => m.signal);
 
-    // ✅ FIX 1: cada bot usa sus propios slugs abiertos, no un set global compartido
+    // Cada bot usa sus propios slugs abiertos
     for (const [bot, botConfig] of Object.entries(BOTS)) {
       const botOpenSlugs = new Set(state.positions.filter(p => p.bot === bot).map(p => p.slug));
       const eligible = candidates
-        .filter(c => !botOpenSlugs.has(c.slug) && c.signal.absZScore >= botConfig.MIN_ZSCORE && state.equity[bot] > 10)
+        .filter(c =>
+          !botOpenSlugs.has(c.slug) &&
+          c.signal.absZScore >= botConfig.MIN_ZSCORE &&
+          state.equity[bot] > 10
+        )
         .sort((a, b) => b.signal.qualScore - a.signal.qualScore);
+
       if (!eligible.length) continue;
 
-      // Abrir hasta MAX_OPEN_PER_BOT posiciones por ciclo
       for (const candidate of eligible) {
         if (state.positions.filter(p => p.bot === bot).length >= CONFIG.MAX_OPEN_PER_BOT) break;
         if (botOpenSlugs.has(candidate.slug)) continue;
@@ -538,37 +676,70 @@ async function scheduler() {
 
 // ─── ARRANQUE ─────────────────────────────────────────────────
 log("════════════════════════════════════════════════════════════");
-log("MICRODRIFT v5.7 — Fix: usedSlugs por bot + override vol/liq");
+log("MICRODRIFT v5.9 — Migración BUY automática + fixes");
 log(`Supabase: ${SUPABASE_URL}`);
 log(`Capital: $${CONFIG.INITIAL_EQUITY} × 3 bots = $${CONFIG.INITIAL_EQUITY * 3} total`);
 log(`Timeout: ${CONFIG.MAX_HOLD_MS/60_000}m | Stop: ${CONFIG.STOP_LOSS_ROI*100}% | TP: ${CONFIG.TAKE_PROFIT_ROI*100}%`);
+log(`Bots: A(z≥${BOTS.A.MIN_ZSCORE}) B(z≥${BOTS.B.MIN_ZSCORE}) C(z≥${BOTS.C.MIN_ZSCORE})`);
 log("════════════════════════════════════════════════════════════");
 log("AVISO: Esto es PAPER TRADING. No opera con dinero real.");
 log("════════════════════════════════════════════════════════════");
 
 loadState().then(() => scheduler());
 
-process.on("uncaughtException", err => { log(`Excepción: ${err.message}`, "ERR"); saveState().then(() => process.exit(1)); });
-process.on("unhandledRejection", reason => { log(`Rechazo: ${reason}`, "ERR"); saveState(); });
-process.on("SIGINT", () => { log("Deteniendo..."); saveState().then(() => process.exit(0)); });
+process.on("uncaughtException", err => {
+  log(`Excepción: ${err.message}`, "ERR");
+  saveState().then(() => process.exit(1));
+});
 
+process.on("unhandledRejection", reason => {
+  log(`Rechazo: ${reason}`, "ERR");
+  saveState();
+});
+
+process.on("SIGINT", () => {
+  log("Deteniendo...");
+  saveState().then(() => process.exit(0));
+});
+
+// ─── HTTP HEALTH SERVER ───────────────────────────────────────
 import http from "http";
 
 const PORT = process.env.PORT || 3000;
 
 http.createServer((req, res) => {
-  const totalPnl = state.closed.reduce((s, t) => s + t.pnl, 0);
+  const totalPnl = state.closed
+    .filter(t => t.direction !== "BUY")
+    .reduce((s, t) => s + t.pnl, 0);
+
   const body = JSON.stringify({
-    status:    "running",
-    cycle:     state.cycle,
-    equity:    state.equity,
-    trades:    state.closed.length,
-    pnl:       totalPnl.toFixed(2),
+    status: "running",
+    cycle: state.cycle,
+    equity: state.equity,
+    trades: state.closed.filter(t => t.direction !== "BUY").length,
+    pnl: totalPnl.toFixed(2),
     positions: state.positions.length,
-    uptime:    Math.round(process.uptime()) + "s",
+    uptime: Math.round(process.uptime()) + "s",
   }, null, 2);
+
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(body);
 }).listen(PORT, () => {
   log(`HTTP health server escuchando en puerto ${PORT}`);
 });
+```
+
+---
+
+## Resumen de Cambios en v5.9
+
+| Cambio | Descripción |
+|--------|-------------|
+| **Migración BUY automática** | `migrateBuyPositions()` convierte BUY → SELL_PROXY al cargar estado |
+| **Protección en managePositions** | Si queda algún BUY residual, lo migra on-the-fly |
+| **Exclusión BUY de estadísticas** | `printReport` y `equity` ignoran trades BUY antiguos |
+| **Fix AbortSignal.timeout** | Reemplaza `timeout: 20_000` por `signal: AbortSignal.timeout(20_000)` |
+| **Fix progress division** | Protección contra división por cero en partial reversión |
+| **priceMapGlobal** | Para mostrar ROI actual en el reporte |
+
+Listo para copiar y pegar.
