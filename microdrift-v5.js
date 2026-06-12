@@ -1,4 +1,3 @@
-```javascript
 // ─── LOGGING ──────────────────────────────────────────────────
 function ts() {
   return new Date().toISOString().slice(0, 19).replace("T", " ");
@@ -25,7 +24,7 @@ const CONFIG = {
   MIN_LIQ_OVERRIDE: 8_000,
   PRICE_MIN_OVERRIDE: 0.01,
   PRICE_MAX_OVERRIDE: 0.95,
-  ZSCORE_OVERRIDE_THRESHOLD: 2.5,
+  ZSCORE_OVERRIDE_THRESHOLD: 2.2,
 
   RISK_PER_TRADE: 0.025,
   MAX_OPEN_PER_BOT: 2,
@@ -197,6 +196,14 @@ async function loadState() {
       migrateBuyPositions();
       // Guardar estado migrado inmediatamente
       await saveState();
+    }
+
+    // ✅ VERIFICACIÓN FINAL: comprobar si aún quedan posiciones BUY abiertas
+    const buyOpen = state.positions.filter(p => p.direction === "BUY").length;
+    if (buyOpen > 0) {
+      log(`⚠️ ATENCIÓN: todavía quedan ${buyOpen} posiciones BUY abiertas`, "WARN");
+    } else {
+      log("✓ Verificación BUY/SELL_PROXY correcta", "INFO");
     }
 
     // Diagnóstico de trades BUY históricos (solo informativo)
@@ -727,19 +734,3 @@ http.createServer((req, res) => {
 }).listen(PORT, () => {
   log(`HTTP health server escuchando en puerto ${PORT}`);
 });
-```
-
----
-
-## Resumen de Cambios en v5.9
-
-| Cambio | Descripción |
-|--------|-------------|
-| **Migración BUY automática** | `migrateBuyPositions()` convierte BUY → SELL_PROXY al cargar estado |
-| **Protección en managePositions** | Si queda algún BUY residual, lo migra on-the-fly |
-| **Exclusión BUY de estadísticas** | `printReport` y `equity` ignoran trades BUY antiguos |
-| **Fix AbortSignal.timeout** | Reemplaza `timeout: 20_000` por `signal: AbortSignal.timeout(20_000)` |
-| **Fix progress division** | Protección contra división por cero en partial reversión |
-| **priceMapGlobal** | Para mostrar ROI actual en el reporte |
-
-Listo para copiar y pegar.
