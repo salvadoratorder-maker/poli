@@ -41,12 +41,12 @@ const CONFIG = {
   HISTORY_WINDOW: 12,
   HISTORY_EXTRA: 2,
   REVERSION_THRESHOLD: 1.8,
-  MIN_HIST_CYCLES: 6,
+  MIN_HIST_CYCLES: 8,
 };
 
 const BOTS = {
-  A: { MIN_ZSCORE: 2.0, label: "Conservative" },
-  B: { MIN_ZSCORE: 1.8, label: "Balanced"     },
+  A: { MIN_ZSCORE: 2.2, label: "Conservative" },
+  B: { MIN_ZSCORE: 2.0, label: "Balanced"     },
   C: { MIN_ZSCORE: 1.8, label: "Aggressive"   },
 };
 
