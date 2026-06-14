@@ -16,18 +16,18 @@ const CONFIG = {
 
   PRICE_MIN: 0.03,
   PRICE_MAX: 0.90,
-  MIN_VOLUME_24H: 20_000,             // 🔬 EXPLORACIÓN: era 50k
-  MIN_LIQ: 10_000,                    // 🔬 EXPLORACIÓN: era 20k
+  MIN_VOLUME_24H: 20_000,
+  MIN_LIQ: 10_000,
 
   // Override para mercados con z-score muy alto
-  MIN_VOLUME_24H_OVERRIDE: 8_000,     // 🔬 EXPLORACIÓN: era 20k
-  MIN_LIQ_OVERRIDE: 3_000,            // 🔬 EXPLORACIÓN: era 8k
+  MIN_VOLUME_24H_OVERRIDE: 8_000,
+  MIN_LIQ_OVERRIDE: 3_000,
   PRICE_MIN_OVERRIDE: 0.01,
   PRICE_MAX_OVERRIDE: 0.95,
   ZSCORE_OVERRIDE_THRESHOLD: 2.5,
 
   RISK_PER_TRADE: 0.025,
-  MAX_OPEN_PER_BOT: 3,                // 🔬 EXPLORACIÓN: era 2
+  MAX_OPEN_PER_BOT: 3,
 
   FEE_RATE: 0.005,
 
@@ -39,15 +39,61 @@ const CONFIG = {
 
   HISTORY_WINDOW: 12,
   HISTORY_EXTRA: 2,
-  REVERSION_THRESHOLD: 1.5,           // 🔬 EXPLORACIÓN: era 1.8
-  MIN_HIST_CYCLES: 4,                 // 🔬 EXPLORACIÓN: era 6
+  REVERSION_THRESHOLD: 1.5,
+  MIN_HIST_CYCLES: 4,
+
+  // ─── DIVERSIFICACIÓN (v6.1) ───────────────────────────────
+  // Límite de posiciones abiertas por categoría temática, por bot
+  MAX_CATEGORY_POSITIONS: { sports: 2, politics: 2, macro: 2, other: 3 },
+  // Límite de posiciones abiertas por equipo/participante concreto, por bot
+  MAX_POSITIONS_PER_KEY: 1,
 };
 
 const BOTS = {
   A: { MIN_ZSCORE: 2.0, label: "Conservative" },
   B: { MIN_ZSCORE: 1.8, label: "Balanced"     },
-  C: { MIN_ZSCORE: 1.5, label: "Aggressive"   }, // 🔬 EXPLORACIÓN: era 1.8
+  C: { MIN_ZSCORE: 1.5, label: "Aggressive"   },
 };
+
+// ─── CATEGORIZACIÓN DE MERCADOS (v6.1) ───────────────────────
+// Keywords de equipos/participantes conocidos.
+// Cualquier mercado que no coincida usará el slug como key (fallback),
+// quedando limitado igualmente a MAX_POSITIONS_PER_KEY sin mantenimiento manual.
+const SPORT_KEYS = [
+  // NBA
+  "knicks", "spurs", "celtics", "lakers", "warriors", "heat", "nuggets",
+  "bucks", "sixers", "suns", "clippers", "nets", "bulls", "pistons",
+  // MLB
+  "yankees", "dodgers", "red sox", "cubs", "astros", "mets", "giants",
+  // NFL
+  "chiefs", "eagles", "patriots", "cowboys", "49ers", "ravens", "packers",
+  // FIFA / World Cup
+  "england", "france", "brazil", "argentina", "germany", "spain", "portugal",
+  // Tenis
+  "djokovic", "alcaraz", "sinner", "nadal", "federer", "swiatek",
+  // F1
+  "verstappen", "hamilton", "leclerc", "norris", "russell",
+  // Ciclismo
+  "pogacar", "vingegaard", "evenepoel",
+];
+
+function marketCategory(question) {
+  const q = question.toLowerCase();
+  if (/nba|mlb|nfl|nhl|fifa|soccer|tennis|f1|formula 1|ufc|world cup|champions league|la liga|premier league|tour de france|wimbledon|roland garros/.test(q)) return "sports";
+  if (/election|president|senate|congress|prime minister|vote|referendum|ballot|governor|mayor/.test(q)) return "politics";
+  if (/fed|federal reserve|interest rate|inflation|gdp|recession|powell|cpi|unemployment|fomc/.test(q)) return "macro";
+  return "other";
+}
+
+function marketKey(question, slug = "") {
+  const q = question.toLowerCase();
+  for (const key of SPORT_KEYS) {
+    if (q.includes(key)) return key;
+  }
+  // Fallback: cada mercado desconocido actúa como su propio key.
+  // Evita mantener una lista infinita y limita igualmente a MAX_POSITIONS_PER_KEY.
+  return slug;
+}
 
 // ─── SUPABASE ─────────────────────────────────────────────────
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -167,7 +213,6 @@ async function loadState() {
       log(`⚠️ DIAGNÓSTICO: BUY cerrados = ${buyTrades.length}, BUY abiertos = ${buyPositions.length}`, "WARN");
     }
 
-    // ✅ Diagnóstico BUY abiertos
     const buyOpen = state.positions.filter(p => p.direction === "BUY").length;
     if (buyOpen > 0) {
       log(`⚠️ ATENCIÓN: quedan ${buyOpen} BUY abiertos`, "WARN");
@@ -345,15 +390,19 @@ function openPosition(bot, m, signal) {
   const invested = state.equity[bot] * CONFIG.RISK_PER_TRADE;
   state.equity[bot] -= invested;
 
+  const cat = marketCategory(m.question);
+  const key = marketKey(m.question, m.slug);
+
   state.positions.push({
     bot, slug: m.slug, question: m.question,
     direction: signal.direction, entry: signal.entryPrice,
     expectedExit: signal.expectedReversion, zScoreAtEntry: signal.zScore,
     invested, shares: invested / signal.entryPrice,
     opened: Date.now(), cycleOpened: state.cycle,
+    category: cat, marketKey: key,
   });
 
-  log(`OPEN ${bot} [${signal.direction}] ${m.slug.slice(0, 30)} entry=${signal.entryPrice.toFixed(3)} z=${signal.zScore.toFixed(2)} $${invested.toFixed(2)}`, "TRADE");
+  log(`OPEN ${bot} [${signal.direction}] [${cat}/${key}] ${m.slug.slice(0, 28)} entry=${signal.entryPrice.toFixed(3)} z=${signal.zScore.toFixed(2)} $${invested.toFixed(2)}`, "TRADE");
 }
 
 async function closePosition(pos, exitPrice, reason) {
@@ -448,7 +497,7 @@ function printReport(totalMarkets, validCount, rejected, candidateCount) {
   log(div);
   log(`CICLO ${state.cycle} | Mercados: ${totalMarkets} total, ${validCount} válidos`);
   log(`Rechazados → precio:${rejected.price} vol:${rejected.volume} liq:${rejected.liquidity}`);
-  log(`Candidatos con señal: ${candidateCount} de ${validCount} mercados válidos`);  // ✅ nuevo
+  log(`Candidatos con señal: ${candidateCount} de ${validCount} mercados válidos`);
 
   for (const b of ["A", "B", "C"]) {
     const openPos   = state.positions.filter(p => p.bot === b);
@@ -457,9 +506,26 @@ function printReport(totalMarkets, validCount, rejected, candidateCount) {
     const pnl       = botClosed.reduce((s, t) => s + t.pnl, 0);
     const wr        = botClosed.length ? ((wins / botClosed.length) * 100).toFixed(0) : "—";
     log(`BOT ${b} (${BOTS[b].label}) | equity=$${state.equity[b].toFixed(2)} | pos=${openPos.length}/${CONFIG.MAX_OPEN_PER_BOT} | DD=${(state.dd[b]*100).toFixed(1)}% | trades=${botClosed.length} WR=${wr}% pnl=$${pnl.toFixed(2)}`);
+
+    // ─── Telemetría de diversificación (v6.1) ───────────────
+    const openByCategory = {};
+    for (const p of openPos) {
+      const cat = p.category || marketCategory(p.question);
+      openByCategory[cat] = (openByCategory[cat] || 0) + 1;
+    }
+    log(
+      `  Categorías: ` +
+      `sports=${openByCategory.sports||0}/${CONFIG.MAX_CATEGORY_POSITIONS.sports} ` +
+      `politics=${openByCategory.politics||0}/${CONFIG.MAX_CATEGORY_POSITIONS.politics} ` +
+      `macro=${openByCategory.macro||0}/${CONFIG.MAX_CATEGORY_POSITIONS.macro} ` +
+      `other=${openByCategory.other||0}/${CONFIG.MAX_CATEGORY_POSITIONS.other}`
+    );
+
     for (const p of openPos) {
       const age = Math.round((Date.now() - p.opened) / 60_000);
-      log(`  └ ${p.direction} ${p.slug.slice(0, 35)} | entry=${p.entry.toFixed(3)} | age=${age}m`);
+      const cat = p.category || marketCategory(p.question);
+      const key = p.marketKey || marketKey(p.question, p.slug);
+      log(`  └ ${p.direction} [${cat}/${key}] ${p.slug.slice(0, 30)} | entry=${p.entry.toFixed(3)} | age=${age}m`);
     }
   }
 
@@ -515,18 +581,47 @@ async function runCycle() {
       .map(m => ({ ...m, signal: computeSignal(m) }))
       .filter(m => m.signal);
 
+    // ─── Apertura de posiciones con filtros de diversificación (v6.1) ───
     for (const [bot, botConfig] of Object.entries(BOTS)) {
       const botOpenSlugs = new Set(state.positions.filter(p => p.bot === bot).map(p => p.slug));
+
+      // Contadores iniciales desde posiciones ya abiertas
+      const openByCategory = {};
+      const openByKey      = {};
+      for (const pos of state.positions.filter(p => p.bot === bot)) {
+        const cat = pos.category || marketCategory(pos.question);
+        const key = pos.marketKey || marketKey(pos.question, pos.slug);
+        openByCategory[cat] = (openByCategory[cat] || 0) + 1;
+        openByKey[key]       = (openByKey[key]       || 0) + 1;
+      }
+
+      // Ordenar por calidad de señal; los filtros de diversificación
+      // se aplican dentro del bucle para que los contadores se actualicen
+      // en tiempo real y no se violen los límites dentro del mismo ciclo.
       const eligible = candidates
-        .filter(c => !botOpenSlugs.has(c.slug) && c.signal.absZScore >= botConfig.MIN_ZSCORE && state.equity[bot] > 10)
+        .filter(c => !botOpenSlugs.has(c.slug))
+        .filter(c => c.signal.absZScore >= botConfig.MIN_ZSCORE)
+        .filter(c => state.equity[bot] > 10)
         .sort((a, b) => b.signal.qualScore - a.signal.qualScore);
-      if (!eligible.length) continue;
 
       for (const candidate of eligible) {
         if (state.positions.filter(p => p.bot === bot).length >= CONFIG.MAX_OPEN_PER_BOT) break;
         if (botOpenSlugs.has(candidate.slug)) continue;
+
+        const cat      = marketCategory(candidate.question);
+        const key      = marketKey(candidate.question, candidate.slug);
+        const catLimit = CONFIG.MAX_CATEGORY_POSITIONS[cat] ?? CONFIG.MAX_CATEGORY_POSITIONS.other;
+
+        // Comprobar límites justo antes de abrir
+        if ((openByCategory[cat] || 0) >= catLimit)                        continue;
+        if ((openByKey[key]       || 0) >= CONFIG.MAX_POSITIONS_PER_KEY)   continue;
+
         openPosition(bot, candidate, candidate.signal);
         botOpenSlugs.add(candidate.slug);
+
+        // Actualizar contadores para la siguiente iteración del bucle
+        openByCategory[cat] = (openByCategory[cat] || 0) + 1;
+        openByKey[key]       = (openByKey[key]       || 0) + 1;
       }
     }
 
@@ -551,12 +646,13 @@ async function scheduler() {
 
 // ─── ARRANQUE ─────────────────────────────────────────────────
 log("════════════════════════════════════════════════════════════");
-log("MICRODRIFT v6.0 — MODO EXPLORACIÓN (objetivo: 50 trades)");
+log("MICRODRIFT v6.1 — DIVERSIFICACIÓN OBLIGATORIA");
 log(`Supabase: ${SUPABASE_URL}`);
 log(`Capital: $${CONFIG.INITIAL_EQUITY} × 3 bots = $${CONFIG.INITIAL_EQUITY * 3} total`);
-log(`Filtros relajados: vol≥20k liq≥10k z≥1.5 hist≥4 max_pos=3`);
+log(`Filtros: vol≥20k liq≥10k z≥1.5 hist≥4 max_pos=3`);
 log(`Timeout: ${CONFIG.MAX_HOLD_MS/3_600_000}h | Stop: ${CONFIG.STOP_LOSS_ROI*100}% | TP: ${CONFIG.TAKE_PROFIT_ROI*100}%`);
 log(`Bots: A(z≥2.0) B(z≥1.8) C(z≥1.5)`);
+log(`Diversificación: max ${CONFIG.MAX_CATEGORY_POSITIONS.sports} sports / ${CONFIG.MAX_CATEGORY_POSITIONS.politics} politics / ${CONFIG.MAX_CATEGORY_POSITIONS.macro} macro por bot | max ${CONFIG.MAX_POSITIONS_PER_KEY} pos/equipo`);
 log("════════════════════════════════════════════════════════════");
 log("AVISO: Esto es PAPER TRADING. No opera con dinero real.");
 log("════════════════════════════════════════════════════════════");
@@ -575,7 +671,7 @@ http.createServer((req, res) => {
   const totalPnl = state.closed.reduce((s, t) => s + t.pnl, 0);
   const body = JSON.stringify({
     status:    "running",
-    version:   "v6.0-exploracion",
+    version:   "v6.1-diversificacion",
     cycle:     state.cycle,
     equity:    state.equity,
     trades:    state.closed.length,
