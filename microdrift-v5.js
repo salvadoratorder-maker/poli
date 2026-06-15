@@ -32,26 +32,52 @@ const CONFIG = {
 
   STOP_LOSS_ROI:   -0.12,
   TAKE_PROFIT_ROI:  0.20,
-  MAX_HOLD_MS: 12 * 60 * 60 * 1000,
+  MAX_HOLD_MS: 24 * 60 * 60 * 1000,   // v6.3: era 12h
 
-  // v6.3: ventana histórica ampliada de 12→24 puntos (= 24h con ciclos de 1h).
-  // Con 12 puntos el z-score se calculaba sobre ruido puro para mercados
-  // de elecciones, World Cup o macro. 24h da una media más representativa.
-  HISTORY_WINDOW:   24,   // era 12
+  HISTORY_WINDOW:   24,                // v6.3: era 12
   HISTORY_EXTRA:     2,
   REVERSION_THRESHOLD: 1.5,
-  MIN_HIST_CYCLES:   8,   // era 4 — mínimo coherente con la ventana ampliada
+  MIN_HIST_CYCLES:   8,                // v6.3: era 4
 
   CYCLE_INTERVAL_MS: 60 * 60 * 1000,
 
-  // v6.3: trailing stop a break-even.
-  // Si el trade alcanza TRAILING_STOP_TRIGGER_ROI, el stop se mueve a entry.
-  // Evita que un trade en positivo se convierta en pérdida.
-  TRAILING_STOP_TRIGGER_ROI: 0.10,
+  TRAILING_STOP_TRIGGER_ROI: 0.10,    // v6.3
 
-  // Diversificación (v6.2)
+  // Diversificación espacial (v6.2)
   MAX_CATEGORY_POSITIONS: { sports: 2, politics: 2, macro: 2, other: 3 },
   MAX_POSITIONS_PER_KEY: 1,
+
+  // ─── ADAPTIVE COOLDOWN (v6.4) ─────────────────────────────
+  // Ciclos de espera mínimos antes de re-entrar en una key,
+  // diferenciados por razón de cierre.
+  //
+  // Lógica:
+  //   TAKE_PROFIT → el mercado llegó a la media, puede rebotar.
+  //                 Esperar más antes de re-entrar.
+  //   STOP_LOSS   → movimiento en contra. Cooldown corto para
+  //                 no perder reversión posterior.
+  //   TIMEOUT     → el precio no se movió. Cooldown mínimo.
+  //   (resto)     → 2 ciclos por defecto conservador.
+  //
+  // Con CYCLE_INTERVAL_MS = 1h:
+  //   TAKE_PROFIT  = 8h de espera
+  //   STOP_LOSS    = 3h
+  //   TIMEOUT      = 1h
+  COOLDOWN_BY_REASON: {
+    TAKE_PROFIT:       8,
+    PARTIAL_REVERSION: 8,
+    TRAILING_STOP:     6,
+    STOP_LOSS:         3,
+    TIMEOUT:           1,
+    MIGRATION_CLOSE:   1,
+    DEFAULT:           2,
+  },
+
+  // Límite adicional: máximo de trades por key en 24h (= 24 ciclos)
+  MAX_TRADES_PER_KEY_24H: 2,
+
+  // Alerta si la utilización de capital cae por debajo de este umbral
+  CAPITAL_UTILIZATION_WARN: 0.20,
 };
 
 const BOTS = {
@@ -143,21 +169,20 @@ async function dbSet(key, value) {
 async function dbInsertTrade(pos, exitPrice, pnl, roi, reason) {
   try {
     await sbFetch("/trades", "POST", {
-      bot:          pos.bot,
-      slug:         pos.slug,
-      direction:    pos.direction,
-      entry:        pos.entry,
-      exit:         exitPrice,
-      invested:     pos.invested,
+      bot:        pos.bot,
+      slug:       pos.slug,
+      direction:  pos.direction,
+      entry:      pos.entry,
+      exit:       exitPrice,
+      invested:   pos.invested,
       pnl,
       roi,
       reason,
-      z_score:      pos.zScoreAtEntry || null,
-      opened_at:    new Date(pos.opened).toISOString(),
-      closed_at:    new Date().toISOString(),
-      // v6.3: MAE/MFE — métricas de excursión máxima
-      mae:          pos.mae ?? null,   // Max Adverse Excursion  (peor ROI visto)
-      mfe:          pos.mfe ?? null,   // Max Favorable Excursion (mejor ROI visto)
+      z_score:    pos.zScoreAtEntry || null,
+      opened_at:  new Date(pos.opened).toISOString(),
+      closed_at:  new Date().toISOString(),
+      mae:        pos.mae ?? null,
+      mfe:        pos.mfe ?? null,
     });
   } catch (err) {
     log(`dbInsertTrade error: ${err.message}`, "ERR");
@@ -175,27 +200,33 @@ let state = {
   dd:              { A: 0, B: 0, C: 0 },
   rejectedHistory: {},
   auditLog:        [],
+  // v6.4: memoria temporal de cierres por key
+  // { [key]: { cycle, reason, roi } }
+  keyCooldown:     {},
 };
 
 async function loadState() {
   log("Cargando estado desde Supabase...");
   try {
-    const [cycle, equity, peak, dd, history, positions, closed, rejHist, auditLog] =
+    const [cycle, equity, peak, dd, history, positions, closed,
+           rejHist, auditLog, keyCooldown] =
       await Promise.all([
         dbGet("cycle"),    dbGet("equity"),   dbGet("peak"),
         dbGet("dd"),       dbGet("history"),  dbGet("positions"),
         dbGet("closed"),   dbGet("rejectedHistory"), dbGet("auditLog"),
+        dbGet("keyCooldown"),   // v6.4
       ]);
 
-    if (cycle     !== null) state.cycle           = cycle;
-    if (equity    !== null) state.equity          = equity;
-    if (peak      !== null) state.peak            = peak;
-    if (dd        !== null) state.dd              = dd;
-    if (history   !== null) state.history         = history;
-    if (positions !== null) state.positions       = positions;
-    if (closed    !== null) state.closed          = closed;
-    if (rejHist   !== null) state.rejectedHistory = rejHist;
-    if (auditLog  !== null) state.auditLog        = auditLog;
+    if (cycle        !== null) state.cycle           = cycle;
+    if (equity       !== null) state.equity          = equity;
+    if (peak         !== null) state.peak            = peak;
+    if (dd           !== null) state.dd              = dd;
+    if (history      !== null) state.history         = history;
+    if (positions    !== null) state.positions       = positions;
+    if (closed       !== null) state.closed          = closed;
+    if (rejHist      !== null) state.rejectedHistory = rejHist;
+    if (auditLog     !== null) state.auditLog        = auditLog;
+    if (keyCooldown  !== null) state.keyCooldown     = keyCooldown;
 
     const buyOpen = state.positions.filter(p => p.direction === "BUY").length;
     if (buyOpen > 0) log(`⚠️ ATENCIÓN: quedan ${buyOpen} BUY abiertos`, "WARN");
@@ -223,7 +254,7 @@ async function loadState() {
       log(`No se pudo recalcular equity: ${eqErr.message}`, "WARN");
     }
 
-    log(`Estado cargado: ciclo=${state.cycle} trades=${state.closed.length} mercados=${Object.keys(state.history).length}`);
+    log(`Estado cargado: ciclo=${state.cycle} trades=${state.closed.length} cooldowns=${Object.keys(state.keyCooldown).length}`);
   } catch (err) {
     log(`Error cargando estado, iniciando desde cero: ${err.message}`, "WARN");
   }
@@ -241,6 +272,7 @@ async function saveState() {
       dbSet("closed",          state.closed),
       dbSet("rejectedHistory", state.rejectedHistory),
       dbSet("auditLog",        state.auditLog),
+      dbSet("keyCooldown",     state.keyCooldown),   // v6.4
     ]);
   } catch (err) {
     log(`saveState error: ${err.message}`, "ERR");
@@ -366,6 +398,30 @@ function calcPnl(entry, exit, invested) {
   return shares * (exit - entry) - invested * CONFIG.FEE_RATE;
 }
 
+// ─── HELPERS COOLDOWN ─────────────────────────────────────────
+
+// Devuelve los ciclos de cooldown según la razón de cierre.
+function cooldownCycles(reason) {
+  return CONFIG.COOLDOWN_BY_REASON[reason] ?? CONFIG.COOLDOWN_BY_REASON.DEFAULT;
+}
+
+// Devuelve true si la key está en cooldown en el ciclo actual.
+function isKeyCoolingDown(key) {
+  const entry = state.keyCooldown[key];
+  if (!entry) return false;
+  const required = cooldownCycles(entry.reason);
+  return (state.cycle - entry.cycle) < required;
+}
+
+// Devuelve cuántos trades se han abierto sobre esta key en las últimas 24h.
+function tradesLast24h(key) {
+  const cutoff = state.cycle - 24;
+  return state.closed.filter(t => {
+    const k = t.marketKey || marketKey(t.question || "", t.slug || "");
+    return k === key && (t.cycleOpened || 0) >= cutoff;
+  }).length;
+}
+
 function openPosition(bot, m, signal) {
   if (state.positions.some(p => p.bot === bot && p.slug === m.slug)) return;
   if (state.positions.filter(p => p.bot === bot).length >= CONFIG.MAX_OPEN_PER_BOT) return;
@@ -384,10 +440,7 @@ function openPosition(bot, m, signal) {
     invested, shares: invested / signal.entryPrice,
     opened: Date.now(), cycleOpened: state.cycle,
     category: cat, marketKey: key,
-    // v6.3: MAE/MFE inicializados a 0 al abrir
-    mae: 0,   // Max Adverse Excursion  — peor ROI visto durante la vida del trade
-    mfe: 0,   // Max Favorable Excursion — mejor ROI visto durante la vida del trade
-    // v6.3: trailing stop — null = no activado todavía
+    mae: 0, mfe: 0,
     trailingStopEntry: null,
   });
 
@@ -409,10 +462,20 @@ async function closePosition(pos, exitPrice, reason) {
 
   state.positions = state.positions.filter(p => p !== pos);
 
-  const sign = netPnl > 0 ? "+" : "";
-  const maeStr = pos.mae != null ? ` mae=${(pos.mae*100).toFixed(1)}%` : "";
-  const mfeStr = pos.mfe != null ? ` mfe=${(pos.mfe*100).toFixed(1)}%` : "";
-  log(`CLOSE ${pos.bot} [${reason}] ${pos.slug.slice(0, 25)} pnl=${sign}$${netPnl.toFixed(2)} roi=${(roi*100).toFixed(1)}%${maeStr}${mfeStr}`, "TRADE");
+  // v6.4: registrar cooldown con razón y ROI para adaptive cooldown
+  const key = pos.marketKey || marketKey(pos.question, pos.slug);
+  state.keyCooldown[key] = { cycle: state.cycle, reason, roi };
+
+  // Limpieza de entradas de cooldown caducadas (>50 ciclos)
+  for (const [k, entry] of Object.entries(state.keyCooldown)) {
+    if (state.cycle - entry.cycle > 50) delete state.keyCooldown[k];
+  }
+
+  const sign    = netPnl > 0 ? "+" : "";
+  const maeStr  = pos.mae != null ? ` mae=${(pos.mae*100).toFixed(1)}%` : "";
+  const mfeStr  = pos.mfe != null ? ` mfe=${(pos.mfe*100).toFixed(1)}%` : "";
+  const cd      = cooldownCycles(reason);
+  log(`CLOSE ${pos.bot} [${reason}] [cd=${cd}c] ${pos.slug.slice(0, 22)} pnl=${sign}$${netPnl.toFixed(2)} roi=${(roi*100).toFixed(1)}%${maeStr}${mfeStr}`, "TRADE");
 
   await dbInsertTrade(pos, exitPrice, netPnl, roi, reason);
   await saveState();
@@ -429,28 +492,19 @@ async function managePositions(markets) {
     const eff = pos.direction === "SELL_PROXY" ? 1 - raw : raw;
     const roi = (eff - pos.entry) / pos.entry;
 
-    // v6.3: actualizar MAE y MFE en cada ciclo
-    // MAE: ROI mínimo visto (adverso). Negativo = pérdida flotante máxima.
-    // MFE: ROI máximo visto (favorable). Positivo = ganancia flotante máxima.
     if (pos.mae == null || roi < pos.mae) pos.mae = roi;
     if (pos.mfe == null || roi > pos.mfe) pos.mfe = roi;
 
-    // v6.3: trailing stop a break-even
-    // Si el trade alcanza TRAILING_STOP_TRIGGER_ROI (+10%), el stop se mueve
-    // a entry (roi = 0 neto antes de fees). Evita que un trade positivo
-    // se convierta en pérdida por reversión posterior.
+    // Trailing stop
     if (roi >= CONFIG.TRAILING_STOP_TRIGGER_ROI && pos.trailingStopEntry === null) {
       pos.trailingStopEntry = pos.entry;
       log(`TRAILING STOP activado ${pos.bot} ${pos.slug.slice(0, 25)} @ roi=${(roi*100).toFixed(1)}%`, "WARN");
     }
-
-    // Evaluar trailing stop: si está activado y el precio ha vuelto a entry, cerrar
     if (pos.trailingStopEntry !== null && eff <= pos.trailingStopEntry) {
       await closePosition(pos, eff, "TRAILING_STOP");
       continue;
     }
 
-    // Reglas de cierre estándar
     if (roi <= CONFIG.STOP_LOSS_ROI)           { await closePosition(pos, eff, "STOP_LOSS");         continue; }
     if (roi >= CONFIG.TAKE_PROFIT_ROI)         { await closePosition(pos, eff, "TAKE_PROFIT");       continue; }
     if (now - pos.opened > CONFIG.MAX_HOLD_MS) { await closePosition(pos, eff, "TIMEOUT");           continue; }
@@ -510,7 +564,17 @@ function printReport(totalMarkets, validCount, rejected, candidateCount) {
   log(div);
   log(`CICLO ${state.cycle} | Mercados: ${totalMarkets} total, ${validCount} válidos`);
   log(`Rechazados → precio:${rejected.price} vol:${rejected.volume} liq:${rejected.liquidity}`);
-  log(`Candidatos con señal: ${candidateCount} de ${validCount} mercados válidos`);
+  log(`Candidatos con señal: ${candidateCount} | En cooldown: ${Object.keys(state.keyCooldown).filter(k => isKeyCoolingDown(k)).length}`);
+
+  // Utilización de capital (v6.4)
+  const totalEquity    = Object.values(state.equity).reduce((s, e) => s + e, 0);
+  const totalInvested  = state.positions.reduce((s, p) => s + p.invested, 0);
+  const utilization    = totalEquity > 0 ? totalInvested / (totalInvested + totalEquity) : 0;
+  if (utilization < CONFIG.CAPITAL_UTILIZATION_WARN && state.cycle > 10) {
+    log(`⚠ CAPITAL_UTILIZATION bajo: ${(utilization*100).toFixed(1)}% (umbral: ${CONFIG.CAPITAL_UTILIZATION_WARN*100}%)`, "WARN");
+  } else {
+    log(`Capital utilización: ${(utilization*100).toFixed(1)}%`);
+  }
 
   for (const b of ["A", "B", "C"]) {
     const openPos   = state.positions.filter(p => p.bot === b);
@@ -544,6 +608,17 @@ function printReport(totalMarkets, validCount, rejected, candidateCount) {
     }
   }
 
+  // Cooldowns activos
+  const activeCooldowns = Object.entries(state.keyCooldown)
+    .filter(([k]) => isKeyCoolingDown(k))
+    .map(([k, e]) => {
+      const remaining = cooldownCycles(e.reason) - (state.cycle - e.cycle);
+      return `${k}(${e.reason.slice(0,2)} ${remaining}c)`;
+    });
+  if (activeCooldowns.length > 0) {
+    log(`Cooldowns activos: ${activeCooldowns.join(" | ")}`);
+  }
+
   const allClosed = state.closed;
   if (allClosed.length > 0) {
     const wins     = allClosed.filter(t => t.pnl > 0);
@@ -555,7 +630,6 @@ function printReport(totalMarkets, validCount, rejected, candidateCount) {
     const wr       = ((wins.length / allClosed.length) * 100).toFixed(1);
     log(`GLOBAL | trades=${allClosed.length} WR=${wr}% PF=${pf} pnl=$${totalPnl.toFixed(2)}`);
 
-    // v6.3: resumen MAE/MFE global sobre trades con datos
     const withMae = allClosed.filter(t => t.mae != null);
     if (withMae.length > 0) {
       const avgMae = withMae.reduce((s, t) => s + t.mae, 0) / withMae.length;
@@ -608,7 +682,7 @@ async function runCycle() {
       .map(m => ({ ...m, signal: computeSignal(m) }))
       .filter(m => m.signal);
 
-    // Contador global de key (compartido entre todos los bots)
+    // Contador global de key (v6.2, compartido entre bots)
     const globalOpenByKey = {};
     for (const pos of state.positions) {
       const key = pos.marketKey || marketKey(pos.question, pos.slug);
@@ -628,6 +702,15 @@ async function runCycle() {
         .filter(c => !botOpenSlugs.has(c.slug))
         .filter(c => c.signal.absZScore >= botConfig.MIN_ZSCORE)
         .filter(c => state.equity[bot] > 10)
+        // v6.4: filtro de cooldown adaptativo (antes del sort por calidad)
+        .filter(c => {
+          const key = marketKey(c.question, c.slug);
+          // 1. Cooldown temporal post-cierre
+          if (isKeyCoolingDown(key)) return false;
+          // 2. Límite de trades por key en 24h
+          if (tradesLast24h(key) >= CONFIG.MAX_TRADES_PER_KEY_24H) return false;
+          return true;
+        })
         .sort((a, b) => b.signal.qualScore - a.signal.qualScore);
 
       for (const candidate of eligible) {
@@ -638,8 +721,8 @@ async function runCycle() {
         const key      = marketKey(candidate.question, candidate.slug);
         const catLimit = CONFIG.MAX_CATEGORY_POSITIONS[cat] ?? CONFIG.MAX_CATEGORY_POSITIONS.other;
 
-        if ((openByCategory[cat]  || 0) >= catLimit)                      continue;
-        if ((globalOpenByKey[key] || 0) >= CONFIG.MAX_POSITIONS_PER_KEY)  continue;
+        if ((openByCategory[cat]  || 0) >= catLimit)                     continue;
+        if ((globalOpenByKey[key] || 0) >= CONFIG.MAX_POSITIONS_PER_KEY) continue;
 
         openPosition(bot, candidate, candidate.signal);
         botOpenSlugs.add(candidate.slug);
@@ -678,13 +761,14 @@ async function scheduler() {
 
 // ─── ARRANQUE ─────────────────────────────────────────────────
 log("════════════════════════════════════════════════════════════");
-log("MICRODRIFT v6.3 — HISTORIA 24h + TRAILING STOP + MAE/MFE");
+log("MICRODRIFT v6.4 — ADAPTIVE COOLDOWN POR KEY");
 log(`Supabase: ${SUPABASE_URL}`);
 log(`Capital: $${CONFIG.INITIAL_EQUITY} × 3 bots = $${CONFIG.INITIAL_EQUITY * 3} total`);
-log(`Ventana histórica: ${CONFIG.HISTORY_WINDOW}h | Min ciclos: ${CONFIG.MIN_HIST_CYCLES}`);
-log(`Timeout: ${CONFIG.MAX_HOLD_MS/3_600_000}h | Stop: ${CONFIG.STOP_LOSS_ROI*100}% | TP: ${CONFIG.TAKE_PROFIT_ROI*100}% | Trailing: ${CONFIG.TRAILING_STOP_TRIGGER_ROI*100}%→BE`);
+log(`Ventana: ${CONFIG.HISTORY_WINDOW}h | MinCiclos: ${CONFIG.MIN_HIST_CYCLES} | Hold: ${CONFIG.MAX_HOLD_MS/3_600_000}h`);
+log(`Stop: ${CONFIG.STOP_LOSS_ROI*100}% | TP: ${CONFIG.TAKE_PROFIT_ROI*100}% | Trailing: ${CONFIG.TRAILING_STOP_TRIGGER_ROI*100}%→BE`);
 log(`Bots: A(z≥2.0) B(z≥1.8) C(z≥1.5)`);
-log(`Diversificación: cat/bot sports≤${CONFIG.MAX_CATEGORY_POSITIONS.sports} politics≤${CONFIG.MAX_CATEGORY_POSITIONS.politics} macro≤${CONFIG.MAX_CATEGORY_POSITIONS.macro} | key global≤${CONFIG.MAX_POSITIONS_PER_KEY}`);
+log(`Diversificación: cat/bot sports≤${CONFIG.MAX_CATEGORY_POSITIONS.sports} politics≤${CONFIG.MAX_CATEGORY_POSITIONS.politics} | key global≤${CONFIG.MAX_POSITIONS_PER_KEY}`);
+log(`Cooldown: TP=${CONFIG.COOLDOWN_BY_REASON.TAKE_PROFIT}c SL=${CONFIG.COOLDOWN_BY_REASON.STOP_LOSS}c TO=${CONFIG.COOLDOWN_BY_REASON.TIMEOUT}c | max ${CONFIG.MAX_TRADES_PER_KEY_24H} trades/key/24h`);
 log("════════════════════════════════════════════════════════════");
 log("AVISO: Esto es PAPER TRADING. No opera con dinero real.");
 log("════════════════════════════════════════════════════════════");
@@ -699,16 +783,18 @@ import http from "http";
 const PORT = process.env.PORT || 3000;
 
 http.createServer((req, res) => {
-  const totalPnl = state.closed.reduce((s, t) => s + t.pnl, 0);
+  const totalPnl       = state.closed.reduce((s, t) => s + t.pnl, 0);
+  const activeCooldowns = Object.keys(state.keyCooldown).filter(k => isKeyCoolingDown(k)).length;
   const body = JSON.stringify({
-    status:    "running",
-    version:   "v6.3-trailing-mae-history24",
-    cycle:     state.cycle,
-    equity:    state.equity,
-    trades:    state.closed.length,
-    pnl:       totalPnl.toFixed(2),
-    positions: state.positions.length,
-    uptime:    Math.round(process.uptime()) + "s",
+    status:          "running",
+    version:         "v6.4-adaptive-cooldown",
+    cycle:           state.cycle,
+    equity:          state.equity,
+    trades:          state.closed.length,
+    pnl:             totalPnl.toFixed(2),
+    positions:       state.positions.length,
+    activeCooldowns,
+    uptime:          Math.round(process.uptime()) + "s",
   }, null, 2);
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(body);
