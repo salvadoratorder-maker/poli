@@ -30,23 +30,27 @@ const CONFIG = {
 
   FEE_RATE: 0.005,
 
-  STOP_LOSS_ROI: -0.12,
-  TAKE_PROFIT_ROI: 0.20,
+  STOP_LOSS_ROI:   -0.12,
+  TAKE_PROFIT_ROI:  0.20,
   MAX_HOLD_MS: 12 * 60 * 60 * 1000,
+
+  // v6.3: ventana histórica ampliada de 12→24 puntos (= 24h con ciclos de 1h).
+  // Con 12 puntos el z-score se calculaba sobre ruido puro para mercados
+  // de elecciones, World Cup o macro. 24h da una media más representativa.
+  HISTORY_WINDOW:   24,   // era 12
+  HISTORY_EXTRA:     2,
+  REVERSION_THRESHOLD: 1.5,
+  MIN_HIST_CYCLES:   8,   // era 4 — mínimo coherente con la ventana ampliada
 
   CYCLE_INTERVAL_MS: 60 * 60 * 1000,
 
-  HISTORY_WINDOW: 12,
-  HISTORY_EXTRA: 2,
-  REVERSION_THRESHOLD: 1.5,
-  MIN_HIST_CYCLES: 4,
+  // v6.3: trailing stop a break-even.
+  // Si el trade alcanza TRAILING_STOP_TRIGGER_ROI, el stop se mueve a entry.
+  // Evita que un trade en positivo se convierta en pérdida.
+  TRAILING_STOP_TRIGGER_ROI: 0.10,
 
-  // ─── DIVERSIFICACIÓN ──────────────────────────────────────
-  // Por bot: máximo de posiciones abiertas por categoría temática
+  // Diversificación (v6.2)
   MAX_CATEGORY_POSITIONS: { sports: 2, politics: 2, macro: 2, other: 3 },
-  // Global (todos los bots): máximo de posiciones por equipo/slug
-  // FIX v6.2: este límite es global, no por bot, para evitar
-  // que A+B+C abran simultáneamente el mismo mercado correlacionado
   MAX_POSITIONS_PER_KEY: 1,
 };
 
@@ -58,20 +62,13 @@ const BOTS = {
 
 // ─── CATEGORIZACIÓN DE MERCADOS ───────────────────────────────
 const SPORT_KEYS = [
-  // NBA
   "knicks", "spurs", "celtics", "lakers", "warriors", "heat", "nuggets",
   "bucks", "sixers", "suns", "clippers", "nets", "bulls", "pistons",
-  // MLB
   "yankees", "dodgers", "red sox", "cubs", "astros", "mets", "giants",
-  // NFL
   "chiefs", "eagles", "patriots", "cowboys", "49ers", "ravens", "packers",
-  // FIFA / World Cup
   "england", "france", "brazil", "argentina", "germany", "spain", "portugal",
-  // Tenis
   "djokovic", "alcaraz", "sinner", "nadal", "federer", "swiatek",
-  // F1
   "verstappen", "hamilton", "leclerc", "norris", "russell",
-  // Ciclismo
   "pogacar", "vingegaard", "evenepoel",
 ];
 
@@ -88,9 +85,6 @@ function marketKey(question, slug = "") {
   for (const key of SPORT_KEYS) {
     if (q.includes(key)) return key;
   }
-  // Fallback: el slug actúa como key único.
-  // Cualquier mercado no listado queda limitado igualmente a MAX_POSITIONS_PER_KEY
-  // sin necesidad de mantener una lista infinita de equipos/participantes.
   return slug;
 }
 
@@ -107,10 +101,10 @@ async function sbFetch(path, method = "GET", body = null) {
   const opts = {
     method,
     headers: {
-      "apikey": SUPABASE_KEY,
+      "apikey":        SUPABASE_KEY,
       "Authorization": `Bearer ${SUPABASE_KEY}`,
-      "Content-Type": "application/json",
-      "Prefer": method === "POST" ? "return=minimal,resolution=merge-duplicates" : "",
+      "Content-Type":  "application/json",
+      "Prefer":        method === "POST" ? "return=minimal,resolution=merge-duplicates" : "",
     },
   };
   if (body) opts.body = JSON.stringify(body);
@@ -149,18 +143,21 @@ async function dbSet(key, value) {
 async function dbInsertTrade(pos, exitPrice, pnl, roi, reason) {
   try {
     await sbFetch("/trades", "POST", {
-      bot:        pos.bot,
-      slug:       pos.slug,
-      direction:  pos.direction,
-      entry:      pos.entry,
-      exit:       exitPrice,
-      invested:   pos.invested,
+      bot:          pos.bot,
+      slug:         pos.slug,
+      direction:    pos.direction,
+      entry:        pos.entry,
+      exit:         exitPrice,
+      invested:     pos.invested,
       pnl,
       roi,
       reason,
-      z_score:    pos.zScoreAtEntry || null,
-      opened_at:  new Date(pos.opened).toISOString(),
-      closed_at:  new Date().toISOString(),
+      z_score:      pos.zScoreAtEntry || null,
+      opened_at:    new Date(pos.opened).toISOString(),
+      closed_at:    new Date().toISOString(),
+      // v6.3: MAE/MFE — métricas de excursión máxima
+      mae:          pos.mae ?? null,   // Max Adverse Excursion  (peor ROI visto)
+      mfe:          pos.mfe ?? null,   // Max Favorable Excursion (mejor ROI visto)
     });
   } catch (err) {
     log(`dbInsertTrade error: ${err.message}`, "ERR");
@@ -185,15 +182,9 @@ async function loadState() {
   try {
     const [cycle, equity, peak, dd, history, positions, closed, rejHist, auditLog] =
       await Promise.all([
-        dbGet("cycle"),
-        dbGet("equity"),
-        dbGet("peak"),
-        dbGet("dd"),
-        dbGet("history"),
-        dbGet("positions"),
-        dbGet("closed"),
-        dbGet("rejectedHistory"),
-        dbGet("auditLog"),
+        dbGet("cycle"),    dbGet("equity"),   dbGet("peak"),
+        dbGet("dd"),       dbGet("history"),  dbGet("positions"),
+        dbGet("closed"),   dbGet("rejectedHistory"), dbGet("auditLog"),
       ]);
 
     if (cycle     !== null) state.cycle           = cycle;
@@ -207,11 +198,8 @@ async function loadState() {
     if (auditLog  !== null) state.auditLog        = auditLog;
 
     const buyOpen = state.positions.filter(p => p.direction === "BUY").length;
-    if (buyOpen > 0) {
-      log(`⚠️ ATENCIÓN: quedan ${buyOpen} BUY abiertos`, "WARN");
-    } else {
-      log("✓ BUY/SELL_PROXY verificado", "INFO");
-    }
+    if (buyOpen > 0) log(`⚠️ ATENCIÓN: quedan ${buyOpen} BUY abiertos`, "WARN");
+    else             log("✓ posiciones verificadas", "INFO");
 
     try {
       const allTrades = await sbFetch("/trades?select=bot,invested,pnl");
@@ -235,7 +223,7 @@ async function loadState() {
       log(`No se pudo recalcular equity: ${eqErr.message}`, "WARN");
     }
 
-    log(`Estado cargado: ciclo=${state.cycle} trades_db=${state.closed.length} mercados_mem=${Object.keys(state.history).length}`);
+    log(`Estado cargado: ciclo=${state.cycle} trades=${state.closed.length} mercados=${Object.keys(state.history).length}`);
   } catch (err) {
     log(`Error cargando estado, iniciando desde cero: ${err.message}`, "WARN");
   }
@@ -260,9 +248,6 @@ async function saveState() {
 }
 
 // ─── API POLYMARKET ───────────────────────────────────────────
-// FIX v6.2: AbortController para timeout real en Node.js nativo.
-// { timeout: N } no tiene efecto en Node — sin este fix los requests
-// pueden colgarse indefinidamente y bloquear el ciclo entero.
 async function fetchMarkets() {
   const controller = new AbortController();
   const timeoutId  = setTimeout(() => controller.abort(), 20_000);
@@ -288,15 +273,11 @@ async function fetchMarkets() {
         question:  (m.question || m.slug).slice(0, 60),
         price:     extractBestPrice(m),
         volume24h: Number(m.volume24hr || 0),
-        liquidity: Number(m.liquidity || 0),
+        liquidity: Number(m.liquidity  || 0),
       }))
       .filter(m => m.price > 0.005 && m.price < 0.995);
   } catch (err) {
-    if (err.name === "AbortError") {
-      log("fetchMarkets: timeout (20s)", "ERR");
-    } else {
-      log(`fetchMarkets failed: ${err.message}`, "ERR");
-    }
+    log(`fetchMarkets: ${err.name === "AbortError" ? "timeout (20s)" : err.message}`, "ERR");
     return [];
   } finally {
     clearTimeout(timeoutId);
@@ -326,11 +307,10 @@ function filterMarkets(markets, signalOverrideSlugs = new Set()) {
   const valid    = [];
   for (const m of markets) {
     const isOverride = signalOverrideSlugs.has(m.slug);
-
-    const priceMin = isOverride ? CONFIG.PRICE_MIN_OVERRIDE : CONFIG.PRICE_MIN;
-    const priceMax = isOverride ? CONFIG.PRICE_MAX_OVERRIDE : CONFIG.PRICE_MAX;
-    const volMin   = isOverride ? CONFIG.MIN_VOLUME_24H_OVERRIDE : CONFIG.MIN_VOLUME_24H;
-    const liqMin   = isOverride ? CONFIG.MIN_LIQ_OVERRIDE        : CONFIG.MIN_LIQ;
+    const priceMin   = isOverride ? CONFIG.PRICE_MIN_OVERRIDE : CONFIG.PRICE_MIN;
+    const priceMax   = isOverride ? CONFIG.PRICE_MAX_OVERRIDE : CONFIG.PRICE_MAX;
+    const volMin     = isOverride ? CONFIG.MIN_VOLUME_24H_OVERRIDE : CONFIG.MIN_VOLUME_24H;
+    const liqMin     = isOverride ? CONFIG.MIN_LIQ_OVERRIDE        : CONFIG.MIN_LIQ;
 
     if (m.price < priceMin || m.price > priceMax) { rejected.price++;     continue; }
     if (m.volume24h < volMin)                      { rejected.volume++;    continue; }
@@ -367,7 +347,7 @@ function computeSignal(m) {
 
   let direction, entryPrice, expectedReversion;
   if (zScore < -CONFIG.REVERSION_THRESHOLD) {
-    direction = "BUY"; entryPrice = m.price; expectedReversion = mean;
+    direction = "BUY";        entryPrice = m.price;     expectedReversion = mean;
   } else if (zScore > CONFIG.REVERSION_THRESHOLD) {
     direction = "SELL_PROXY"; entryPrice = 1 - m.price; expectedReversion = 1 - mean;
   } else {
@@ -376,7 +356,7 @@ function computeSignal(m) {
 
   const absZScore = Math.abs(zScore);
   const volBonus  = Math.min(1.2, 1 + (m.volume24h - CONFIG.MIN_VOLUME_24H) / 500_000);
-  const liqBonus  = Math.min(1.1, 1 + (m.liquidity - CONFIG.MIN_LIQ) / 200_000);
+  const liqBonus  = Math.min(1.1, 1 + (m.liquidity  - CONFIG.MIN_LIQ)        / 200_000);
 
   return { direction, entryPrice, expectedReversion, zScore, absZScore, qualScore: absZScore * volBonus * liqBonus, mean, std };
 }
@@ -404,6 +384,11 @@ function openPosition(bot, m, signal) {
     invested, shares: invested / signal.entryPrice,
     opened: Date.now(), cycleOpened: state.cycle,
     category: cat, marketKey: key,
+    // v6.3: MAE/MFE inicializados a 0 al abrir
+    mae: 0,   // Max Adverse Excursion  — peor ROI visto durante la vida del trade
+    mfe: 0,   // Max Favorable Excursion — mejor ROI visto durante la vida del trade
+    // v6.3: trailing stop — null = no activado todavía
+    trailingStopEntry: null,
   });
 
   log(`OPEN ${bot} [${signal.direction}] [${cat}/${key}] ${m.slug.slice(0, 28)} entry=${signal.entryPrice.toFixed(3)} z=${signal.zScore.toFixed(2)} $${invested.toFixed(2)}`, "TRADE");
@@ -425,7 +410,9 @@ async function closePosition(pos, exitPrice, reason) {
   state.positions = state.positions.filter(p => p !== pos);
 
   const sign = netPnl > 0 ? "+" : "";
-  log(`CLOSE ${pos.bot} [${reason}] ${pos.slug.slice(0, 25)} pnl=${sign}$${netPnl.toFixed(2)} roi=${(roi*100).toFixed(1)}%`, "TRADE");
+  const maeStr = pos.mae != null ? ` mae=${(pos.mae*100).toFixed(1)}%` : "";
+  const mfeStr = pos.mfe != null ? ` mfe=${(pos.mfe*100).toFixed(1)}%` : "";
+  log(`CLOSE ${pos.bot} [${reason}] ${pos.slug.slice(0, 25)} pnl=${sign}$${netPnl.toFixed(2)} roi=${(roi*100).toFixed(1)}%${maeStr}${mfeStr}`, "TRADE");
 
   await dbInsertTrade(pos, exitPrice, netPnl, roi, reason);
   await saveState();
@@ -442,6 +429,28 @@ async function managePositions(markets) {
     const eff = pos.direction === "SELL_PROXY" ? 1 - raw : raw;
     const roi = (eff - pos.entry) / pos.entry;
 
+    // v6.3: actualizar MAE y MFE en cada ciclo
+    // MAE: ROI mínimo visto (adverso). Negativo = pérdida flotante máxima.
+    // MFE: ROI máximo visto (favorable). Positivo = ganancia flotante máxima.
+    if (pos.mae == null || roi < pos.mae) pos.mae = roi;
+    if (pos.mfe == null || roi > pos.mfe) pos.mfe = roi;
+
+    // v6.3: trailing stop a break-even
+    // Si el trade alcanza TRAILING_STOP_TRIGGER_ROI (+10%), el stop se mueve
+    // a entry (roi = 0 neto antes de fees). Evita que un trade positivo
+    // se convierta en pérdida por reversión posterior.
+    if (roi >= CONFIG.TRAILING_STOP_TRIGGER_ROI && pos.trailingStopEntry === null) {
+      pos.trailingStopEntry = pos.entry;
+      log(`TRAILING STOP activado ${pos.bot} ${pos.slug.slice(0, 25)} @ roi=${(roi*100).toFixed(1)}%`, "WARN");
+    }
+
+    // Evaluar trailing stop: si está activado y el precio ha vuelto a entry, cerrar
+    if (pos.trailingStopEntry !== null && eff <= pos.trailingStopEntry) {
+      await closePosition(pos, eff, "TRAILING_STOP");
+      continue;
+    }
+
+    // Reglas de cierre estándar
     if (roi <= CONFIG.STOP_LOSS_ROI)           { await closePosition(pos, eff, "STOP_LOSS");         continue; }
     if (roi >= CONFIG.TAKE_PROFIT_ROI)         { await closePosition(pos, eff, "TAKE_PROFIT");       continue; }
     if (now - pos.opened > CONFIG.MAX_HOLD_MS) { await closePosition(pos, eff, "TIMEOUT");           continue; }
@@ -451,9 +460,6 @@ async function managePositions(markets) {
   }
 }
 
-// FIX v6.2: validSlugs se construye antes de llamar a auditRejected
-// y se pasa explícitamente, eliminando la dependencia implícita de orden
-// en la asignación de _validSlugs que existía en v6.1.
 function auditRejected(rejected, allMarkets, validSlugs) {
   if (!state.rejectedHistory) state.rejectedHistory = {};
   if (!state.auditLog)        state.auditLog = [];
@@ -506,13 +512,6 @@ function printReport(totalMarkets, validCount, rejected, candidateCount) {
   log(`Rechazados → precio:${rejected.price} vol:${rejected.volume} liq:${rejected.liquidity}`);
   log(`Candidatos con señal: ${candidateCount} de ${validCount} mercados válidos`);
 
-  // Contador global de posiciones por key (para mostrar en reporte)
-  const globalKeyCount = {};
-  for (const pos of state.positions) {
-    const key = pos.marketKey || marketKey(pos.question, pos.slug);
-    globalKeyCount[key] = (globalKeyCount[key] || 0) + 1;
-  }
-
   for (const b of ["A", "B", "C"]) {
     const openPos   = state.positions.filter(p => p.bot === b);
     const botClosed = state.closed.filter(t => t.bot === b);
@@ -521,7 +520,6 @@ function printReport(totalMarkets, validCount, rejected, candidateCount) {
     const wr        = botClosed.length ? ((wins / botClosed.length) * 100).toFixed(0) : "—";
     log(`BOT ${b} (${BOTS[b].label}) | equity=$${state.equity[b].toFixed(2)} | pos=${openPos.length}/${CONFIG.MAX_OPEN_PER_BOT} | DD=${(state.dd[b]*100).toFixed(1)}% | trades=${botClosed.length} WR=${wr}% pnl=$${pnl.toFixed(2)}`);
 
-    // Telemetría de diversificación por categoría (por bot)
     const openByCategory = {};
     for (const p of openPos) {
       const cat = p.category || marketCategory(p.question);
@@ -536,10 +534,13 @@ function printReport(totalMarkets, validCount, rejected, candidateCount) {
     );
 
     for (const p of openPos) {
-      const age = Math.round((Date.now() - p.opened) / 60_000);
-      const cat = p.category || marketCategory(p.question);
-      const key = p.marketKey || marketKey(p.question, p.slug);
-      log(`  └ ${p.direction} [${cat}/${key}] ${p.slug.slice(0, 30)} | entry=${p.entry.toFixed(3)} | age=${age}m`);
+      const age    = Math.round((Date.now() - p.opened) / 60_000);
+      const cat    = p.category  || marketCategory(p.question);
+      const key    = p.marketKey || marketKey(p.question, p.slug);
+      const tsFlag = p.trailingStopEntry !== null ? " [TS✓]" : "";
+      const maeStr = p.mae != null ? ` mae=${(p.mae*100).toFixed(1)}%` : "";
+      const mfeStr = p.mfe != null ? ` mfe=${(p.mfe*100).toFixed(1)}%` : "";
+      log(`  └ ${p.direction} [${cat}/${key}]${tsFlag} ${p.slug.slice(0, 28)} | entry=${p.entry.toFixed(3)} | age=${age}m${maeStr}${mfeStr}`);
     }
   }
 
@@ -553,6 +554,15 @@ function printReport(totalMarkets, validCount, rejected, candidateCount) {
     const pf       = gl > 0 ? (gw / gl).toFixed(2) : "∞";
     const wr       = ((wins.length / allClosed.length) * 100).toFixed(1);
     log(`GLOBAL | trades=${allClosed.length} WR=${wr}% PF=${pf} pnl=$${totalPnl.toFixed(2)}`);
+
+    // v6.3: resumen MAE/MFE global sobre trades con datos
+    const withMae = allClosed.filter(t => t.mae != null);
+    if (withMae.length > 0) {
+      const avgMae = withMae.reduce((s, t) => s + t.mae, 0) / withMae.length;
+      const avgMfe = withMae.reduce((s, t) => s + t.mfe, 0) / withMae.length;
+      log(`MAE/MFE (n=${withMae.length}) | avg MAE=${(avgMae*100).toFixed(1)}% avg MFE=${(avgMfe*100).toFixed(1)}%`);
+    }
+
     const byReason = {};
     for (const t of allClosed) {
       if (!byReason[t.reason]) byReason[t.reason] = { n: 0, pnl: 0 };
@@ -563,9 +573,7 @@ function printReport(totalMarkets, validCount, rejected, candidateCount) {
   log(div);
 }
 
-// FIX v6.2: lock para evitar solapamiento de ciclos.
-// Si runCycle() tarda más de CYCLE_INTERVAL_MS, el siguiente scheduler()
-// no inicia un nuevo ciclo encima — espera a que el actual termine.
+// ─── SCHEDULER CON LOCK ───────────────────────────────────────
 let cycleRunning = false;
 
 async function runCycle() {
@@ -588,13 +596,10 @@ async function runCycle() {
         const z = (prices[prices.length - 1] - mean) / std;
         if (Math.abs(z) >= CONFIG.ZSCORE_OVERRIDE_THRESHOLD) signalOverrideSlugs.add(slug);
       }
-      if (signalOverrideSlugs.size > 0) log(`Override vol/liq/precio para ${signalOverrideSlugs.size} slugs con z≥${CONFIG.ZSCORE_OVERRIDE_THRESHOLD}`);
+      if (signalOverrideSlugs.size > 0) log(`Override vol/liq para ${signalOverrideSlugs.size} slugs con z≥${CONFIG.ZSCORE_OVERRIDE_THRESHOLD}`);
     }
 
     const { valid, rejected } = filterMarkets(allMarkets, signalOverrideSlugs);
-
-    // FIX v6.2: validSlugs se construye aquí y se pasa explícitamente
-    // a auditRejected, eliminando la dependencia implícita de _validSlugs.
     const validSlugs = new Set(valid.map(m => m.slug));
 
     updateHistory(valid);
@@ -603,17 +608,7 @@ async function runCycle() {
       .map(m => ({ ...m, signal: computeSignal(m) }))
       .filter(m => m.signal);
 
-    // ─── Apertura de posiciones con diversificación (v6.2) ────
-    //
-    // Dos niveles de límite:
-    //   1. MAX_CATEGORY_POSITIONS → por bot (cada bot gestiona su exposición sectorial)
-    //   2. MAX_POSITIONS_PER_KEY  → GLOBAL entre todos los bots
-    //
-    // FIX v6.2: en v6.1 openByKey era local a cada bot, por lo que A, B y C
-    // podían abrir simultáneamente el mismo mercado (ej: Brazil, England).
-    // Ahora globalOpenByKey se inicializa una sola vez con TODAS las posiciones
-    // abiertas y se comparte entre los tres bots durante el ciclo de apertura.
-
+    // Contador global de key (compartido entre todos los bots)
     const globalOpenByKey = {};
     for (const pos of state.positions) {
       const key = pos.marketKey || marketKey(pos.question, pos.slug);
@@ -623,7 +618,6 @@ async function runCycle() {
     for (const [bot, botConfig] of Object.entries(BOTS)) {
       const botOpenSlugs = new Set(state.positions.filter(p => p.bot === bot).map(p => p.slug));
 
-      // Contadores por categoría: locales a cada bot
       const openByCategory = {};
       for (const pos of state.positions.filter(p => p.bot === bot)) {
         const cat = pos.category || marketCategory(pos.question);
@@ -644,16 +638,12 @@ async function runCycle() {
         const key      = marketKey(candidate.question, candidate.slug);
         const catLimit = CONFIG.MAX_CATEGORY_POSITIONS[cat] ?? CONFIG.MAX_CATEGORY_POSITIONS.other;
 
-        // Límite por categoría: local al bot
-        if ((openByCategory[cat] || 0) >= catLimit) continue;
-
-        // Límite por key: global entre todos los bots
-        if ((globalOpenByKey[key] || 0) >= CONFIG.MAX_POSITIONS_PER_KEY) continue;
+        if ((openByCategory[cat]  || 0) >= catLimit)                      continue;
+        if ((globalOpenByKey[key] || 0) >= CONFIG.MAX_POSITIONS_PER_KEY)  continue;
 
         openPosition(bot, candidate, candidate.signal);
         botOpenSlugs.add(candidate.slug);
 
-        // Actualizar ambos contadores para la siguiente iteración
         openByCategory[cat]    = (openByCategory[cat]    || 0) + 1;
         globalOpenByKey[key]   = (globalOpenByKey[key]   || 0) + 1;
       }
@@ -671,9 +661,6 @@ async function runCycle() {
   }
 }
 
-// FIX v6.2: scheduler con lock.
-// Antes: setTimeout(scheduler, delay) dentro de scheduler() async
-// podía solapar ciclos si runCycle() tardaba más de CYCLE_INTERVAL_MS.
 async function scheduler() {
   if (cycleRunning) {
     log("Ciclo anterior todavía en ejecución, saltando tick", "WARN");
@@ -691,11 +678,11 @@ async function scheduler() {
 
 // ─── ARRANQUE ─────────────────────────────────────────────────
 log("════════════════════════════════════════════════════════════");
-log("MICRODRIFT v6.2 — FIX: KEY GLOBAL + TIMEOUT + LOCK");
+log("MICRODRIFT v6.3 — HISTORIA 24h + TRAILING STOP + MAE/MFE");
 log(`Supabase: ${SUPABASE_URL}`);
 log(`Capital: $${CONFIG.INITIAL_EQUITY} × 3 bots = $${CONFIG.INITIAL_EQUITY * 3} total`);
-log(`Filtros: vol≥20k liq≥10k z≥1.5 hist≥4 max_pos=3`);
-log(`Timeout: ${CONFIG.MAX_HOLD_MS/3_600_000}h | Stop: ${CONFIG.STOP_LOSS_ROI*100}% | TP: ${CONFIG.TAKE_PROFIT_ROI*100}%`);
+log(`Ventana histórica: ${CONFIG.HISTORY_WINDOW}h | Min ciclos: ${CONFIG.MIN_HIST_CYCLES}`);
+log(`Timeout: ${CONFIG.MAX_HOLD_MS/3_600_000}h | Stop: ${CONFIG.STOP_LOSS_ROI*100}% | TP: ${CONFIG.TAKE_PROFIT_ROI*100}% | Trailing: ${CONFIG.TRAILING_STOP_TRIGGER_ROI*100}%→BE`);
 log(`Bots: A(z≥2.0) B(z≥1.8) C(z≥1.5)`);
 log(`Diversificación: cat/bot sports≤${CONFIG.MAX_CATEGORY_POSITIONS.sports} politics≤${CONFIG.MAX_CATEGORY_POSITIONS.politics} macro≤${CONFIG.MAX_CATEGORY_POSITIONS.macro} | key global≤${CONFIG.MAX_POSITIONS_PER_KEY}`);
 log("════════════════════════════════════════════════════════════");
@@ -709,14 +696,13 @@ process.on("unhandledRejection", reason => { log(`Rechazo: ${reason}`, "ERR"); s
 process.on("SIGINT",             ()     => { log("Deteniendo..."); saveState().then(() => process.exit(0)); });
 
 import http from "http";
-
 const PORT = process.env.PORT || 3000;
 
 http.createServer((req, res) => {
   const totalPnl = state.closed.reduce((s, t) => s + t.pnl, 0);
   const body = JSON.stringify({
     status:    "running",
-    version:   "v6.2-key-global",
+    version:   "v6.3-trailing-mae-history24",
     cycle:     state.cycle,
     equity:    state.equity,
     trades:    state.closed.length,
@@ -726,6 +712,4 @@ http.createServer((req, res) => {
   }, null, 2);
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(body);
-}).listen(PORT, () => {
-  log(`HTTP health server escuchando en puerto ${PORT}`);
-});
+}).listen(PORT, () => log(`HTTP health server escuchando en puerto ${PORT}`));
