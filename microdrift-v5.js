@@ -566,6 +566,23 @@ function printReport(totalMarkets, validCount, rejected, candidateCount) {
   log(`Rechazados → precio:${rejected.price} vol:${rejected.volume} liq:${rejected.liquidity}`);
   log(`Candidatos con señal: ${candidateCount} | En cooldown: ${Object.keys(state.keyCooldown).filter(k => isKeyCoolingDown(k)).length}`);
 
+  // v6.5: breakdown de rechazos — cuello de botella visible en cada ciclo
+  if (state._lastRejection) {
+    const r = state._lastRejection;
+    log(
+      `Rechazos: sinSeñal=${r.noSignal} z=${r.zScore} cooldown=${r.cooldown}` +
+      ` 24h=${r.maxPerKey24h} yaAbierto=${r.alreadyOpen}` +
+      ` cat=${r.categoryFull} keyFull=${r.keyFull} slots=${r.maxSlots} capital=${r.noCapital}`
+    );
+    // Identificar el cuello de botella dominante
+    const bottleneck = Object.entries(r)
+      .filter(([k]) => k !== 'noCapital')
+      .sort(([,a],[,b]) => b - a)[0];
+    if (bottleneck && bottleneck[1] > 0) {
+      log(`Cuello de botella: ${bottleneck[0]} (${bottleneck[1]} rechazos)`);
+    }
+  }
+
   // Utilización de capital (v6.4)
   const totalEquity    = Object.values(state.equity).reduce((s, e) => s + e, 0);
   const totalInvested  = state.positions.reduce((s, p) => s + p.invested, 0);
@@ -678,11 +695,27 @@ async function runCycle() {
 
     updateHistory(valid);
 
-    const candidates = valid
-      .map(m => ({ ...m, signal: computeSignal(m) }))
-      .filter(m => m.signal);
+    // ─── BREAKDOWN DE RECHAZOS (v6.5) ────────────────────────
+    // Contadores acumulados sobre todos los bots para identificar
+    // qué filtro es el cuello de botella real del sistema.
+    const rejection = {
+      noSignal:     0,  // historial insuficiente, std<0.005, o z bajo umbral global
+      zScore:       0,  // señal existe pero z insuficiente para este bot
+      cooldown:     0,  // key en cooldown post-cierre
+      maxPerKey24h: 0,  // límite trades/key/24h alcanzado
+      alreadyOpen:  0,  // slug ya abierto por este bot
+      categoryFull: 0,  // MAX_CATEGORY_POSITIONS alcanzado
+      keyFull:      0,  // MAX_POSITIONS_PER_KEY global alcanzado
+      noCapital:    0,  // equity < 10
+      maxSlots:     0,  // MAX_OPEN_PER_BOT alcanzado
+    };
 
-    // Contador global de key (v6.2, compartido entre bots)
+    // Candidatos con señal (independiente de bot)
+    const allWithSignal = valid.map(m => ({ ...m, signal: computeSignal(m) }));
+    rejection.noSignal  = allWithSignal.filter(m => !m.signal).length;
+    const candidates    = allWithSignal.filter(m => m.signal);
+
+    // Contador global de key compartido entre bots (v6.2)
     const globalOpenByKey = {};
     for (const pos of state.positions) {
       const key = pos.marketKey || marketKey(pos.question, pos.slug);
@@ -698,39 +731,45 @@ async function runCycle() {
         openByCategory[cat] = (openByCategory[cat] || 0) + 1;
       }
 
-      const eligible = candidates
-        .filter(c => !botOpenSlugs.has(c.slug))
-        .filter(c => c.signal.absZScore >= botConfig.MIN_ZSCORE)
-        .filter(c => state.equity[bot] > 10)
-        // v6.4: filtro de cooldown adaptativo (antes del sort por calidad)
-        .filter(c => {
-          const key = marketKey(c.question, c.slug);
-          // 1. Cooldown temporal post-cierre
-          if (isKeyCoolingDown(key)) return false;
-          // 2. Límite de trades por key en 24h
-          if (tradesLast24h(key) >= CONFIG.MAX_TRADES_PER_KEY_24H) return false;
-          return true;
-        })
-        .sort((a, b) => b.signal.qualScore - a.signal.qualScore);
+      // Aplicar filtros en secuencia contando rechazos por motivo (v6.5)
+      const eligible = [];
+      for (const c of candidates) {
+        if (botOpenSlugs.has(c.slug))                              { rejection.alreadyOpen++;   continue; }
+        if (state.equity[bot] < 10)                               { rejection.noCapital++;     continue; }
+        if (c.signal.absZScore < botConfig.MIN_ZSCORE)            { rejection.zScore++;        continue; }
+        const key = marketKey(c.question, c.slug);
+        if (isKeyCoolingDown(key))                                 { rejection.cooldown++;      continue; }
+        if (tradesLast24h(key) >= CONFIG.MAX_TRADES_PER_KEY_24H)  { rejection.maxPerKey24h++;  continue; }
+        const cat      = marketCategory(c.question);
+        const catLimit = CONFIG.MAX_CATEGORY_POSITIONS[cat] ?? CONFIG.MAX_CATEGORY_POSITIONS.other;
+        if ((openByCategory[cat]  || 0) >= catLimit)              { rejection.categoryFull++;  continue; }
+        if ((globalOpenByKey[key] || 0) >= CONFIG.MAX_POSITIONS_PER_KEY) { rejection.keyFull++; continue; }
+        eligible.push(c);
+      }
+
+      eligible.sort((a, b) => b.signal.qualScore - a.signal.qualScore);
 
       for (const candidate of eligible) {
-        if (state.positions.filter(p => p.bot === bot).length >= CONFIG.MAX_OPEN_PER_BOT) break;
+        if (state.positions.filter(p => p.bot === bot).length >= CONFIG.MAX_OPEN_PER_BOT) {
+          rejection.maxSlots++;
+          break;
+        }
         if (botOpenSlugs.has(candidate.slug)) continue;
 
-        const cat      = marketCategory(candidate.question);
-        const key      = marketKey(candidate.question, candidate.slug);
-        const catLimit = CONFIG.MAX_CATEGORY_POSITIONS[cat] ?? CONFIG.MAX_CATEGORY_POSITIONS.other;
-
-        if ((openByCategory[cat]  || 0) >= catLimit)                     continue;
-        if ((globalOpenByKey[key] || 0) >= CONFIG.MAX_POSITIONS_PER_KEY) continue;
+        const cat = marketCategory(candidate.question);
+        const key = marketKey(candidate.question, candidate.slug);
 
         openPosition(bot, candidate, candidate.signal);
         botOpenSlugs.add(candidate.slug);
 
-        openByCategory[cat]    = (openByCategory[cat]    || 0) + 1;
-        globalOpenByKey[key]   = (globalOpenByKey[key]   || 0) + 1;
+        openByCategory[cat]  = (openByCategory[cat]  || 0) + 1;
+        globalOpenByKey[key] = (globalOpenByKey[key] || 0) + 1;
       }
     }
+
+    // Guardar breakdown para printReport
+    state._lastRejection = rejection;
+
 
     auditRejected(rejected, allMarkets, validSlugs);
     printReport(allMarkets.length, valid.length, rejected, candidates.length);
@@ -761,7 +800,7 @@ async function scheduler() {
 
 // ─── ARRANQUE ─────────────────────────────────────────────────
 log("════════════════════════════════════════════════════════════");
-log("MICRODRIFT v6.4 — ADAPTIVE COOLDOWN POR KEY");
+log("MICRODRIFT v6.5 — BREAKDOWN DE RECHAZOS + VISIBILIDAD");
 log(`Supabase: ${SUPABASE_URL}`);
 log(`Capital: $${CONFIG.INITIAL_EQUITY} × 3 bots = $${CONFIG.INITIAL_EQUITY * 3} total`);
 log(`Ventana: ${CONFIG.HISTORY_WINDOW}h | MinCiclos: ${CONFIG.MIN_HIST_CYCLES} | Hold: ${CONFIG.MAX_HOLD_MS/3_600_000}h`);
@@ -787,7 +826,7 @@ http.createServer((req, res) => {
   const activeCooldowns = Object.keys(state.keyCooldown).filter(k => isKeyCoolingDown(k)).length;
   const body = JSON.stringify({
     status:          "running",
-    version:         "v6.4-adaptive-cooldown",
+    version:         "v6.5-rejection-breakdown",
     cycle:           state.cycle,
     equity:          state.equity,
     trades:          state.closed.length,
