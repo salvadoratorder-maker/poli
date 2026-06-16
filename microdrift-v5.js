@@ -593,6 +593,11 @@ function printReport(totalMarkets, validCount, rejected, candidateCount) {
     log(`Capital utilización: ${(utilization*100).toFixed(1)}%`);
   }
 
+  // Mercados con historial suficiente (de v6.6, sin sus otros cambios)
+  const withHist = Object.entries(state.history)
+    .filter(([_, h]) => h.length >= CONFIG.MIN_HIST_CYCLES).length;
+  log(`Historial: ${withHist}/${Object.keys(state.history).length} mercados con ≥${CONFIG.MIN_HIST_CYCLES} ciclos`);
+
   for (const b of ["A", "B", "C"]) {
     const openPos   = state.positions.filter(p => p.bot === b);
     const botClosed = state.closed.filter(t => t.bot === b);
@@ -800,7 +805,7 @@ async function scheduler() {
 
 // ─── ARRANQUE ─────────────────────────────────────────────────
 log("════════════════════════════════════════════════════════════");
-log("MICRODRIFT v6.5 — BREAKDOWN DE RECHAZOS + VISIBILIDAD");
+log("MICRODRIFT v6.5 — BREAKDOWN DE RECHAZOS + HISTORIAL + VISIBILIDAD");
 log(`Supabase: ${SUPABASE_URL}`);
 log(`Capital: $${CONFIG.INITIAL_EQUITY} × 3 bots = $${CONFIG.INITIAL_EQUITY * 3} total`);
 log(`Ventana: ${CONFIG.HISTORY_WINDOW}h | MinCiclos: ${CONFIG.MIN_HIST_CYCLES} | Hold: ${CONFIG.MAX_HOLD_MS/3_600_000}h`);
