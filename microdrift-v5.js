@@ -41,6 +41,26 @@ const CONFIG = {
 
   CYCLE_INTERVAL_MS: 60 * 60 * 1000,
 
+  // ─── RESET DE HISTORIAL POR SALTO (v6.6) ─────────────────
+  // Si el precio de un mercado cambia más de este umbral en un ciclo,
+  // el historial se resetea. Evita que medias de regímenes distintos
+  // (Portugal favorito vs Portugal eliminado) contaminen el z-score.
+  HISTORY_JUMP_THRESHOLD: 0.15,
+
+  // ─── Z-EXIT (v6.6) ────────────────────────────────────────
+  // Cerrar posición cuando la anomalía estadística que justificó
+  // la entrada ha desaparecido: abs(currentZ) < umbral.
+  // Alinea la salida con la razón de entrada (mean reversion puro).
+  Z_EXIT_THRESHOLD: 0.5,
+
+  // ─── SLOPE FILTER (v6.6) ──────────────────────────────────
+  // Pendiente mínima (por ciclo) para considerar una tendencia activa.
+  // Si la pendiente del historial va en contra de la reversión esperada,
+  // no abrir la posición (el mercado sigue con drift, no revirtiendo).
+  // Calculada como regresión lineal simple sobre el historial completo.
+  SLOPE_FILTER_ENABLED: true,
+  SLOPE_TREND_THRESHOLD: 0.003,  // >0.003/ciclo = tendencia significativa
+
   TRAILING_STOP_TRIGGER_ROI: 0.10,    // v6.3
 
   // Diversificación espacial (v6.2)
@@ -69,6 +89,7 @@ const CONFIG = {
     TRAILING_STOP:     6,
     STOP_LOSS:         3,
     TIMEOUT:           1,
+    Z_EXIT:            2,   // v6.6: la señal desapareció, espera moderada
     MIGRATION_CLOSE:   1,
     DEFAULT:           2,
   },
@@ -181,8 +202,9 @@ async function dbInsertTrade(pos, exitPrice, pnl, roi, reason) {
       z_score:    pos.zScoreAtEntry || null,
       opened_at:  new Date(pos.opened).toISOString(),
       closed_at:  new Date().toISOString(),
-      mae:        pos.mae ?? null,
-      mfe:        pos.mfe ?? null,
+      mae:        pos.mae        ?? null,
+      mfe:        pos.mfe        ?? null,
+      entry_slope: pos.entrySlope ?? null,   // v6.6
     });
   } catch (err) {
     log(`dbInsertTrade error: ${err.message}`, "ERR");
@@ -355,6 +377,21 @@ function filterMarkets(markets, signalOverrideSlugs = new Set()) {
 function updateHistory(markets) {
   for (const m of markets) {
     if (!state.history[m.slug]) state.history[m.slug] = [];
+
+    // v6.6: reset si el precio salta más de HISTORY_JUMP_THRESHOLD en un ciclo.
+    // Evita que medias de regímenes distintos contaminen el z-score.
+    // Ejemplo: Portugal a 0.82 (favorito) + Portugal a 0.08 (eliminado)
+    // produce una media de 0.45 que no representa ningún régimen real.
+    const hist = state.history[m.slug];
+    if (hist.length > 0) {
+      const lastPrice = hist[hist.length - 1];
+      const jump = Math.abs(m.price - lastPrice);
+      if (jump > CONFIG.HISTORY_JUMP_THRESHOLD) {
+        log(`RESET historial ${m.slug.slice(0, 30)}: salto ${lastPrice.toFixed(3)}→${m.price.toFixed(3)} (Δ${jump.toFixed(3)})`, "WARN");
+        state.history[m.slug] = [];
+      }
+    }
+
     state.history[m.slug].push(m.price);
     if (state.history[m.slug].length > CONFIG.HISTORY_WINDOW + CONFIG.HISTORY_EXTRA) {
       state.history[m.slug].shift();
@@ -390,7 +427,35 @@ function computeSignal(m) {
   const volBonus  = Math.min(1.2, 1 + (m.volume24h - CONFIG.MIN_VOLUME_24H) / 500_000);
   const liqBonus  = Math.min(1.1, 1 + (m.liquidity  - CONFIG.MIN_LIQ)        / 200_000);
 
-  return { direction, entryPrice, expectedReversion, zScore, absZScore, qualScore: absZScore * volBonus * liqBonus, mean, std };
+  // v6.6: calcular pendiente para slope filter y registro al abrir
+  const slope = computeSlope(hist);
+
+  // v6.6: slope filter — si la tendencia va en contra de la reversión esperada,
+  // no generar señal. Evita entrar en mercados con drift real activo.
+  // BUY (precio bajo, esperamos subida): pendiente positiva es OK, negativa es drift.
+  // SELL_PROXY (precio alto, esperamos bajada): pendiente negativa es OK, positiva es drift.
+  if (CONFIG.SLOPE_FILTER_ENABLED) {
+    if (direction === "BUY"        && slope < -CONFIG.SLOPE_TREND_THRESHOLD) return null;
+    if (direction === "SELL_PROXY" && slope >  CONFIG.SLOPE_TREND_THRESHOLD) return null;
+  }
+
+  return { direction, entryPrice, expectedReversion, zScore, absZScore, qualScore: absZScore * volBonus * liqBonus, mean, std, slope };
+}
+
+// v6.6: calcula la pendiente (slope) del historial mediante regresión lineal simple.
+// Valor positivo = precio subiendo. Negativo = bajando.
+// Unidades: cambio de precio por ciclo.
+function computeSlope(hist) {
+  const n = hist.length;
+  if (n < 3) return 0;
+  const xMean = (n - 1) / 2;
+  const yMean = hist.reduce((s, p) => s + p, 0) / n;
+  let num = 0, den = 0;
+  for (let i = 0; i < n; i++) {
+    num += (i - xMean) * (hist[i] - yMean);
+    den += (i - xMean) ** 2;
+  }
+  return den > 0 ? num / den : 0;
 }
 
 function calcPnl(entry, exit, invested) {
@@ -442,9 +507,14 @@ function openPosition(bot, m, signal) {
     category: cat, marketKey: key,
     mae: 0, mfe: 0,
     trailingStopEntry: null,
+    // v6.6: contexto estadístico en el momento de entrada para z-exit y análisis
+    entryMean:  signal.mean,
+    entryStd:   signal.std,
+    entrySlope: signal.slope ?? 0,
   });
 
-  log(`OPEN ${bot} [${signal.direction}] [${cat}/${key}] ${m.slug.slice(0, 28)} entry=${signal.entryPrice.toFixed(3)} z=${signal.zScore.toFixed(2)} $${invested.toFixed(2)}`, "TRADE");
+  const slopeStr = signal.slope !== undefined ? ` slope=${signal.slope.toFixed(4)}` : "";
+  log(`OPEN ${bot} [${signal.direction}] [${cat}/${key}] ${m.slug.slice(0, 28)} entry=${signal.entryPrice.toFixed(3)} z=${signal.zScore.toFixed(2)}${slopeStr} $${invested.toFixed(2)}`, "TRADE");
 }
 
 async function closePosition(pos, exitPrice, reason) {
@@ -494,6 +564,20 @@ async function managePositions(markets) {
 
     if (pos.mae == null || roi < pos.mae) pos.mae = roi;
     if (pos.mfe == null || roi > pos.mfe) pos.mfe = roi;
+
+    // v6.6: z-exit — cerrar si la anomalía estadística que justificó la entrada
+    // ya ha desaparecido. Alinea la salida con la razón de entrada.
+    // Solo si tenemos contexto estadístico de entrada (entryMean/entryStd).
+    if (pos.entryMean != null && pos.entryStd != null && pos.entryStd > 0) {
+      const hist = state.history[pos.slug];
+      if (hist && hist.length >= CONFIG.MIN_HIST_CYCLES) {
+        const currentZ = (raw - pos.entryMean) / pos.entryStd;
+        if (Math.abs(currentZ) < CONFIG.Z_EXIT_THRESHOLD) {
+          await closePosition(pos, eff, "Z_EXIT");
+          continue;
+        }
+      }
+    }
 
     // Trailing stop
     if (roi >= CONFIG.TRAILING_STOP_TRIGGER_ROI && pos.trailingStopEntry === null) {
@@ -570,7 +654,7 @@ function printReport(totalMarkets, validCount, rejected, candidateCount) {
   if (state._lastRejection) {
     const r = state._lastRejection;
     log(
-      `Rechazos: sinSeñal=${r.noSignal} z=${r.zScore} cooldown=${r.cooldown}` +
+      `Rechazos: sinSeñal=${r.noSignal} slope=${r.slope} z=${r.zScore} cooldown=${r.cooldown}` +
       ` 24h=${r.maxPerKey24h} yaAbierto=${r.alreadyOpen}` +
       ` cat=${r.categoryFull} keyFull=${r.keyFull} slots=${r.maxSlots} capital=${r.noCapital}`
     );
@@ -661,10 +745,34 @@ function printReport(totalMarkets, validCount, rejected, candidateCount) {
 
     const byReason = {};
     for (const t of allClosed) {
-      if (!byReason[t.reason]) byReason[t.reason] = { n: 0, pnl: 0 };
-      byReason[t.reason].n++; byReason[t.reason].pnl += t.pnl;
+      if (!byReason[t.reason]) byReason[t.reason] = { n: 0, pnl: 0, wins: 0 };
+      byReason[t.reason].n++;
+      byReason[t.reason].pnl += t.pnl;
+      if (t.pnl > 0) byReason[t.reason].wins++;
     }
-    for (const [r, s] of Object.entries(byReason)) log(`  ${r}: ${s.n} trades pnl=$${s.pnl.toFixed(2)}`);
+    for (const [r, s] of Object.entries(byReason)) {
+      const avg = (s.pnl / s.n).toFixed(2);
+      const bw  = s.wins || 0;
+      const wr  = s.n ? ((bw / s.n) * 100).toFixed(0) : "—";
+      log(`  ${r}: ${s.n} trades WR=${wr}% avg=$${avg} pnl=$${s.pnl.toFixed(2)}`);
+    }
+
+    // v6.6: métricas por dirección (BUY vs SELL_PROXY)
+    const byDir = {};
+    for (const t of allClosed) {
+      const d = t.direction || "?";
+      if (!byDir[d]) byDir[d] = { n: 0, pnl: 0, wins: 0 };
+      byDir[d].n++;
+      byDir[d].pnl += t.pnl;
+      if (t.pnl > 0) byDir[d].wins++;
+    }
+    for (const [d, s] of Object.entries(byDir)) {
+      const gl2  = allClosed.filter(t => t.direction === d && t.pnl < 0).reduce((a,t) => a + Math.abs(t.pnl), 0);
+      const gw2  = allClosed.filter(t => t.direction === d && t.pnl > 0).reduce((a,t) => a + t.pnl, 0);
+      const pf2  = gl2 > 0 ? (gw2 / gl2).toFixed(2) : "∞";
+      const wr2  = s.n ? ((s.wins / s.n) * 100).toFixed(0) : "—";
+      log(`  DIR ${d}: ${s.n} trades WR=${wr2}% PF=${pf2} pnl=$${s.pnl.toFixed(2)}`);
+    }
   }
   log(div);
 }
@@ -705,6 +813,7 @@ async function runCycle() {
     // qué filtro es el cuello de botella real del sistema.
     const rejection = {
       noSignal:     0,  // historial insuficiente, std<0.005, o z bajo umbral global
+      slope:        0,  // v6.6: filtrado por slope filter (drift activo)
       zScore:       0,  // señal existe pero z insuficiente para este bot
       cooldown:     0,  // key en cooldown post-cierre
       maxPerKey24h: 0,  // límite trades/key/24h alcanzado
@@ -716,9 +825,24 @@ async function runCycle() {
     };
 
     // Candidatos con señal (independiente de bot)
-    const allWithSignal = valid.map(m => ({ ...m, signal: computeSignal(m) }));
-    rejection.noSignal  = allWithSignal.filter(m => !m.signal).length;
-    const candidates    = allWithSignal.filter(m => m.signal);
+    // v6.6: computeSignal puede retornar null por slope filter además de por
+    // historial insuficiente/std/z. Distinguimos ambos contando con slope desactivado.
+    const allWithSignal = valid.map(m => {
+      const signal = computeSignal(m);
+      // Para contar slope rejections: si no hay señal, probar sin slope filter
+      if (!signal && CONFIG.SLOPE_FILTER_ENABLED) {
+        const origFlag = CONFIG.SLOPE_FILTER_ENABLED;
+        CONFIG.SLOPE_FILTER_ENABLED = false;
+        const signalNoSlope = computeSignal(m);
+        CONFIG.SLOPE_FILTER_ENABLED = origFlag;
+        if (signalNoSlope) rejection.slope++;
+        else               rejection.noSignal++;
+      } else if (!signal) {
+        rejection.noSignal++;
+      }
+      return { ...m, signal };
+    });
+    const candidates = allWithSignal.filter(m => m.signal);
 
     // Contador global de key compartido entre bots (v6.2)
     const globalOpenByKey = {};
@@ -805,11 +929,12 @@ async function scheduler() {
 
 // ─── ARRANQUE ─────────────────────────────────────────────────
 log("════════════════════════════════════════════════════════════");
-log("MICRODRIFT v6.5 — BREAKDOWN DE RECHAZOS + HISTORIAL + VISIBILIDAD");
+log("MICRODRIFT v6.6 — RESET HISTORIAL + SLOPE + Z-EXIT");
 log(`Supabase: ${SUPABASE_URL}`);
 log(`Capital: $${CONFIG.INITIAL_EQUITY} × 3 bots = $${CONFIG.INITIAL_EQUITY * 3} total`);
 log(`Ventana: ${CONFIG.HISTORY_WINDOW}h | MinCiclos: ${CONFIG.MIN_HIST_CYCLES} | Hold: ${CONFIG.MAX_HOLD_MS/3_600_000}h`);
-log(`Stop: ${CONFIG.STOP_LOSS_ROI*100}% | TP: ${CONFIG.TAKE_PROFIT_ROI*100}% | Trailing: ${CONFIG.TRAILING_STOP_TRIGGER_ROI*100}%→BE`);
+log(`Stop: ${CONFIG.STOP_LOSS_ROI*100}% | TP: ${CONFIG.TAKE_PROFIT_ROI*100}% | Trailing: ${CONFIG.TRAILING_STOP_TRIGGER_ROI*100}%→BE | Z-exit: abs(z)<${CONFIG.Z_EXIT_THRESHOLD}`);
+log(`Slope filter: ${CONFIG.SLOPE_FILTER_ENABLED ? "ON" : "OFF"} threshold=${CONFIG.SLOPE_TREND_THRESHOLD}/ciclo | Jump reset: Δ>${CONFIG.HISTORY_JUMP_THRESHOLD}`);
 log(`Bots: A(z≥2.0) B(z≥1.8) C(z≥1.5)`);
 log(`Diversificación: cat/bot sports≤${CONFIG.MAX_CATEGORY_POSITIONS.sports} politics≤${CONFIG.MAX_CATEGORY_POSITIONS.politics} | key global≤${CONFIG.MAX_POSITIONS_PER_KEY}`);
 log(`Cooldown: TP=${CONFIG.COOLDOWN_BY_REASON.TAKE_PROFIT}c SL=${CONFIG.COOLDOWN_BY_REASON.STOP_LOSS}c TO=${CONFIG.COOLDOWN_BY_REASON.TIMEOUT}c | max ${CONFIG.MAX_TRADES_PER_KEY_24H} trades/key/24h`);
@@ -831,7 +956,7 @@ http.createServer((req, res) => {
   const activeCooldowns = Object.keys(state.keyCooldown).filter(k => isKeyCoolingDown(k)).length;
   const body = JSON.stringify({
     status:          "running",
-    version:         "v6.5-rejection-breakdown",
+    version:         "v6.6-reset-slope-zexit",
     cycle:           state.cycle,
     equity:          state.equity,
     trades:          state.closed.length,
