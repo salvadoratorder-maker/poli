@@ -244,6 +244,31 @@ async function loadState() {
     if (peak         !== null) state.peak            = peak;
     if (dd           !== null) state.dd              = dd;
     if (history      !== null) state.history         = history;
+
+    // v6.7: limpiar historiales contaminados al arrancar.
+    // Si el bot arrancó con v6.4/v6.5 (sin reset por salto), Supabase puede
+    // tener historiales que mezclan regímenes distintos (ej: Portugal favorito
+    // + Portugal eliminado). Al cargar el estado, detectar saltos y conservar
+    // solo los precios desde el último salto grande.
+    let cleanedCount = 0;
+    for (const [slug, prices] of Object.entries(state.history)) {
+      // Buscar el último salto grande en el historial
+      let lastJumpIdx = -1;
+      for (let i = 1; i < prices.length; i++) {
+        if (Math.abs(prices[i] - prices[i - 1]) > CONFIG.HISTORY_JUMP_THRESHOLD) {
+          lastJumpIdx = i;
+        }
+      }
+      if (lastJumpIdx !== -1) {
+        const before = prices.length;
+        state.history[slug] = prices.slice(lastJumpIdx);
+        cleanedCount++;
+        log(`loadState: RESET historial contaminado ${slug.slice(0, 35)} (${before}pts → ${state.history[slug].length}pts, último salto en idx ${lastJumpIdx})`, "WARN");
+      }
+    }
+    if (cleanedCount > 0) {
+      log(`loadState: ${cleanedCount} historiales limpiados por saltos detectados`, "WARN");
+    }
     if (positions    !== null) state.positions       = positions;
     if (closed       !== null) state.closed          = closed;
     if (rejHist      !== null) state.rejectedHistory = rejHist;
@@ -929,12 +954,12 @@ async function scheduler() {
 
 // ─── ARRANQUE ─────────────────────────────────────────────────
 log("════════════════════════════════════════════════════════════");
-log("MICRODRIFT v6.6 — RESET HISTORIAL + SLOPE + Z-EXIT");
+log("MICRODRIFT v6.7 — LIMPIEZA HISTORIAL EN ARRANQUE");
 log(`Supabase: ${SUPABASE_URL}`);
 log(`Capital: $${CONFIG.INITIAL_EQUITY} × 3 bots = $${CONFIG.INITIAL_EQUITY * 3} total`);
 log(`Ventana: ${CONFIG.HISTORY_WINDOW}h | MinCiclos: ${CONFIG.MIN_HIST_CYCLES} | Hold: ${CONFIG.MAX_HOLD_MS/3_600_000}h`);
 log(`Stop: ${CONFIG.STOP_LOSS_ROI*100}% | TP: ${CONFIG.TAKE_PROFIT_ROI*100}% | Trailing: ${CONFIG.TRAILING_STOP_TRIGGER_ROI*100}%→BE | Z-exit: abs(z)<${CONFIG.Z_EXIT_THRESHOLD}`);
-log(`Slope filter: ${CONFIG.SLOPE_FILTER_ENABLED ? "ON" : "OFF"} threshold=${CONFIG.SLOPE_TREND_THRESHOLD}/ciclo | Jump reset: Δ>${CONFIG.HISTORY_JUMP_THRESHOLD}`);
+log(`Slope filter: ${CONFIG.SLOPE_FILTER_ENABLED ? "ON" : "OFF"} threshold=${CONFIG.SLOPE_TREND_THRESHOLD}/ciclo | Jump reset: Δ>${CONFIG.HISTORY_JUMP_THRESHOLD} (arranque + ciclo)`);
 log(`Bots: A(z≥2.0) B(z≥1.8) C(z≥1.5)`);
 log(`Diversificación: cat/bot sports≤${CONFIG.MAX_CATEGORY_POSITIONS.sports} politics≤${CONFIG.MAX_CATEGORY_POSITIONS.politics} | key global≤${CONFIG.MAX_POSITIONS_PER_KEY}`);
 log(`Cooldown: TP=${CONFIG.COOLDOWN_BY_REASON.TAKE_PROFIT}c SL=${CONFIG.COOLDOWN_BY_REASON.STOP_LOSS}c TO=${CONFIG.COOLDOWN_BY_REASON.TIMEOUT}c | max ${CONFIG.MAX_TRADES_PER_KEY_24H} trades/key/24h`);
@@ -956,7 +981,7 @@ http.createServer((req, res) => {
   const activeCooldowns = Object.keys(state.keyCooldown).filter(k => isKeyCoolingDown(k)).length;
   const body = JSON.stringify({
     status:          "running",
-    version:         "v6.6-reset-slope-zexit",
+    version:         "v6.7-history-cleanup",
     cycle:           state.cycle,
     equity:          state.equity,
     trades:          state.closed.length,
