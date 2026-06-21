@@ -47,11 +47,18 @@ const CONFIG = {
   // (Portugal favorito vs Portugal eliminado) contaminen el z-score.
   HISTORY_JUMP_THRESHOLD: 0.15,
 
-  // ─── Z-EXIT (v6.6) ────────────────────────────────────────
-  // Cerrar posición cuando la anomalía estadística que justificó
-  // la entrada ha desaparecido: abs(currentZ) < umbral.
-  // Alinea la salida con la razón de entrada (mean reversion puro).
+  // ─── Z-EXIT DINÁMICO (v6.8) ──────────────────────────────
+  // Cerrar cuando abs(z actual vs media/std ACTUAL del historial) < umbral.
+  // v6.8: usa media y std del historial en el momento de cierre,
+  // no las congeladas en la entrada. Responde al régimen actual del mercado.
   Z_EXIT_THRESHOLD: 0.5,
+
+  // ─── FILTRO DE DESVIACIÓN MÍNIMA (v6.8) ──────────────────
+  // Evita señales con z extremo causado por std muy pequeña.
+  // Ejemplo: z=4.85 con desviación real de 0.007 no es una oportunidad,
+  // es un mercado estable con ruido amplificado por baja volatilidad.
+  // Solo generar señal si abs(precio - media) > este umbral.
+  MIN_ABSOLUTE_DEVIATION: 0.02,
 
   // ─── SLOPE FILTER (v6.6) ──────────────────────────────────
   // Pendiente mínima (por ciclo) para considerar una tendencia activa.
@@ -205,6 +212,7 @@ async function dbInsertTrade(pos, exitPrice, pnl, roi, reason) {
       mae:        pos.mae        ?? null,
       mfe:        pos.mfe        ?? null,
       entry_slope: pos.entrySlope ?? null,   // v6.6
+      regime_age:  pos.regimeAge  ?? null,   // v6.8
     });
   } catch (err) {
     log(`dbInsertTrade error: ${err.message}`, "ERR");
@@ -439,6 +447,11 @@ function computeSignal(m) {
 
   const zScore = (m.price - mean) / std;
 
+  // v6.8: filtro de desviación absoluta mínima.
+  // Rechaza señales donde el movimiento real es irrelevante aunque el z sea extremo.
+  // Brasil z=-4.78 con desviación de 0.007 es ruido, no oportunidad.
+  if (Math.abs(m.price - mean) < CONFIG.MIN_ABSOLUTE_DEVIATION) return null;
+
   let direction, entryPrice, expectedReversion;
   if (zScore < -CONFIG.REVERSION_THRESHOLD) {
     direction = "BUY";        entryPrice = m.price;     expectedReversion = mean;
@@ -464,7 +477,7 @@ function computeSignal(m) {
     if (direction === "SELL_PROXY" && slope >  CONFIG.SLOPE_TREND_THRESHOLD) return null;
   }
 
-  return { direction, entryPrice, expectedReversion, zScore, absZScore, qualScore: absZScore * volBonus * liqBonus, mean, std, slope };
+  return { direction, entryPrice, expectedReversion, zScore, absZScore, qualScore: absZScore * volBonus * liqBonus, mean, std, slope, histLength: n };
 }
 
 // v6.6: calcula la pendiente (slope) del historial mediante regresión lineal simple.
@@ -536,10 +549,15 @@ function openPosition(bot, m, signal) {
     entryMean:  signal.mean,
     entryStd:   signal.std,
     entrySlope: signal.slope ?? 0,
+    // v6.8: edad del régimen al entrar = nº de puntos en el historial.
+    // Permite analizar si los trades malos vienen de historiales jóvenes
+    // (recién reseteados, media poco fiable) vs historiales maduros.
+    regimeAge: signal.histLength ?? 0,
   });
 
   const slopeStr = signal.slope !== undefined ? ` slope=${signal.slope.toFixed(4)}` : "";
-  log(`OPEN ${bot} [${signal.direction}] [${cat}/${key}] ${m.slug.slice(0, 28)} entry=${signal.entryPrice.toFixed(3)} z=${signal.zScore.toFixed(2)}${slopeStr} $${invested.toFixed(2)}`, "TRADE");
+  const ageStr   = signal.histLength ? ` age=${signal.histLength}pts` : "";
+  log(`OPEN ${bot} [${signal.direction}] [${cat}/${key}] ${m.slug.slice(0, 28)} entry=${signal.entryPrice.toFixed(3)} z=${signal.zScore.toFixed(2)}${slopeStr}${ageStr} $${invested.toFixed(2)}`, "TRADE");
 }
 
 async function closePosition(pos, exitPrice, reason) {
@@ -590,16 +608,21 @@ async function managePositions(markets) {
     if (pos.mae == null || roi < pos.mae) pos.mae = roi;
     if (pos.mfe == null || roi > pos.mfe) pos.mfe = roi;
 
-    // v6.6: z-exit — cerrar si la anomalía estadística que justificó la entrada
-    // ya ha desaparecido. Alinea la salida con la razón de entrada.
-    // Solo si tenemos contexto estadístico de entrada (entryMean/entryStd).
-    if (pos.entryMean != null && pos.entryStd != null && pos.entryStd > 0) {
+    // v6.8: z-exit DINÁMICO — cerrar si la anomalía ha desaparecido respecto
+    // a la media/std ACTUAL del historial (no las congeladas en la entrada).
+    // Funciona también para posiciones heredadas sin entryMean guardado.
+    // Esto responde al régimen actual del mercado, no al de cuando se entró.
+    {
       const hist = state.history[pos.slug];
       if (hist && hist.length >= CONFIG.MIN_HIST_CYCLES) {
-        const currentZ = (raw - pos.entryMean) / pos.entryStd;
-        if (Math.abs(currentZ) < CONFIG.Z_EXIT_THRESHOLD) {
-          await closePosition(pos, eff, "Z_EXIT");
-          continue;
+        const currentMean = hist.reduce((s, p) => s + p, 0) / hist.length;
+        const currentStd  = Math.sqrt(hist.reduce((s, p) => s + (p - currentMean) ** 2, 0) / (hist.length - 1));
+        if (currentStd > 0.005) {
+          const currentZ = (raw - currentMean) / currentStd;
+          if (Math.abs(currentZ) < CONFIG.Z_EXIT_THRESHOLD) {
+            await closePosition(pos, eff, "Z_EXIT");
+            continue;
+          }
         }
       }
     }
@@ -679,7 +702,7 @@ function printReport(totalMarkets, validCount, rejected, candidateCount) {
   if (state._lastRejection) {
     const r = state._lastRejection;
     log(
-      `Rechazos: sinSeñal=${r.noSignal} slope=${r.slope} z=${r.zScore} cooldown=${r.cooldown}` +
+      `Rechazos: sinSeñal=${r.noSignal} minDev=${r.minDev} slope=${r.slope} z=${r.zScore} cooldown=${r.cooldown}` +
       ` 24h=${r.maxPerKey24h} yaAbierto=${r.alreadyOpen}` +
       ` cat=${r.categoryFull} keyFull=${r.keyFull} slots=${r.maxSlots} capital=${r.noCapital}`
     );
@@ -735,7 +758,8 @@ function printReport(totalMarkets, validCount, rejected, candidateCount) {
       const tsFlag = p.trailingStopEntry !== null ? " [TS✓]" : "";
       const maeStr = p.mae != null ? ` mae=${(p.mae*100).toFixed(1)}%` : "";
       const mfeStr = p.mfe != null ? ` mfe=${(p.mfe*100).toFixed(1)}%` : "";
-      log(`  └ ${p.direction} [${cat}/${key}]${tsFlag} ${p.slug.slice(0, 28)} | entry=${p.entry.toFixed(3)} | age=${age}m${maeStr}${mfeStr}`);
+      const rAge = p.regimeAge ? ` régimen=${p.regimeAge}pts` : "";
+      log(`  └ ${p.direction} [${cat}/${key}]${tsFlag} ${p.slug.slice(0, 28)} | entry=${p.entry.toFixed(3)} | age=${age}m${rAge}${maeStr}${mfeStr}`);
     }
   }
 
@@ -838,6 +862,7 @@ async function runCycle() {
     // qué filtro es el cuello de botella real del sistema.
     const rejection = {
       noSignal:     0,  // historial insuficiente, std<0.005, o z bajo umbral global
+      minDev:       0,  // v6.8: desviación absoluta insuficiente (z alto por std baja)
       slope:        0,  // v6.6: filtrado por slope filter (drift activo)
       zScore:       0,  // señal existe pero z insuficiente para este bot
       cooldown:     0,  // key en cooldown post-cierre
@@ -857,11 +882,22 @@ async function runCycle() {
       // Para contar slope rejections: si no hay señal, probar sin slope filter
       if (!signal && CONFIG.SLOPE_FILTER_ENABLED) {
         const origFlag = CONFIG.SLOPE_FILTER_ENABLED;
+        const origMinDev = CONFIG.MIN_ABSOLUTE_DEVIATION;
         CONFIG.SLOPE_FILTER_ENABLED = false;
-        const signalNoSlope = computeSignal(m);
+        CONFIG.MIN_ABSOLUTE_DEVIATION = 0;
+        const signalNoFilters = computeSignal(m);
         CONFIG.SLOPE_FILTER_ENABLED = origFlag;
-        if (signalNoSlope) rejection.slope++;
-        else               rejection.noSignal++;
+        CONFIG.MIN_ABSOLUTE_DEVIATION = origMinDev;
+        if (signalNoFilters) {
+          // Tenía señal sin filtros — determinar cuál filtró
+          CONFIG.MIN_ABSOLUTE_DEVIATION = 0;
+          const signalWithSlope = computeSignal(m);
+          CONFIG.MIN_ABSOLUTE_DEVIATION = origMinDev;
+          if (!signalWithSlope) rejection.minDev++;
+          else                  rejection.slope++;
+        } else {
+          rejection.noSignal++;
+        }
       } else if (!signal) {
         rejection.noSignal++;
       }
@@ -954,12 +990,12 @@ async function scheduler() {
 
 // ─── ARRANQUE ─────────────────────────────────────────────────
 log("════════════════════════════════════════════════════════════");
-log("MICRODRIFT v6.7 — LIMPIEZA HISTORIAL EN ARRANQUE");
+log("MICRODRIFT v6.8 — Z-EXIT DINÁMICO + DESVIACIÓN MÍNIMA + REGIME AGE");
 log(`Supabase: ${SUPABASE_URL}`);
 log(`Capital: $${CONFIG.INITIAL_EQUITY} × 3 bots = $${CONFIG.INITIAL_EQUITY * 3} total`);
 log(`Ventana: ${CONFIG.HISTORY_WINDOW}h | MinCiclos: ${CONFIG.MIN_HIST_CYCLES} | Hold: ${CONFIG.MAX_HOLD_MS/3_600_000}h`);
 log(`Stop: ${CONFIG.STOP_LOSS_ROI*100}% | TP: ${CONFIG.TAKE_PROFIT_ROI*100}% | Trailing: ${CONFIG.TRAILING_STOP_TRIGGER_ROI*100}%→BE | Z-exit: abs(z)<${CONFIG.Z_EXIT_THRESHOLD}`);
-log(`Slope filter: ${CONFIG.SLOPE_FILTER_ENABLED ? "ON" : "OFF"} threshold=${CONFIG.SLOPE_TREND_THRESHOLD}/ciclo | Jump reset: Δ>${CONFIG.HISTORY_JUMP_THRESHOLD} (arranque + ciclo)`);
+log(`Slope filter: ${CONFIG.SLOPE_FILTER_ENABLED ? "ON" : "OFF"} threshold=${CONFIG.SLOPE_TREND_THRESHOLD}/ciclo | Jump reset: Δ>${CONFIG.HISTORY_JUMP_THRESHOLD} | MinDev: ${CONFIG.MIN_ABSOLUTE_DEVIATION}`);
 log(`Bots: A(z≥2.0) B(z≥1.8) C(z≥1.5)`);
 log(`Diversificación: cat/bot sports≤${CONFIG.MAX_CATEGORY_POSITIONS.sports} politics≤${CONFIG.MAX_CATEGORY_POSITIONS.politics} | key global≤${CONFIG.MAX_POSITIONS_PER_KEY}`);
 log(`Cooldown: TP=${CONFIG.COOLDOWN_BY_REASON.TAKE_PROFIT}c SL=${CONFIG.COOLDOWN_BY_REASON.STOP_LOSS}c TO=${CONFIG.COOLDOWN_BY_REASON.TIMEOUT}c | max ${CONFIG.MAX_TRADES_PER_KEY_24H} trades/key/24h`);
@@ -981,7 +1017,7 @@ http.createServer((req, res) => {
   const activeCooldowns = Object.keys(state.keyCooldown).filter(k => isKeyCoolingDown(k)).length;
   const body = JSON.stringify({
     status:          "running",
-    version:         "v6.7-history-cleanup",
+    version:         "v6.8-zexit-dynamic-mindev",
     cycle:           state.cycle,
     equity:          state.equity,
     trades:          state.closed.length,
