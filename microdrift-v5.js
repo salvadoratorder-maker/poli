@@ -209,18 +209,23 @@ let state = {
   rejectedHistory: {},
   auditLog:        [],
   keyCooldown:     {},
+  // v7.0: log analítico de señales rechazadas por filtros de vol/liq.
+  // Registra el resultado hipotético de cada señal descartada para
+  // calcular PF virtual y evaluar si los filtros son demasiado restrictivos.
+  analyticsLog:    [],
 };
 
 async function loadState() {
   log("Cargando estado desde Supabase...");
   try {
     const [cycle, equity, peak, dd, history, positions, closed,
-           rejHist, auditLog, keyCooldown] =
+           rejHist, auditLog, keyCooldown, analyticsLog] =
       await Promise.all([
         dbGet("cycle"),    dbGet("equity"),   dbGet("peak"),
         dbGet("dd"),       dbGet("history"),  dbGet("positions"),
         dbGet("closed"),   dbGet("rejectedHistory"), dbGet("auditLog"),
         dbGet("keyCooldown"),
+        dbGet("analyticsLog"),   // v7.0
       ]);
 
     if (cycle       !== null) state.cycle           = cycle;
@@ -251,7 +256,8 @@ async function loadState() {
     if (closed      !== null) state.closed          = closed;
     if (rejHist     !== null) state.rejectedHistory = rejHist;
     if (auditLog    !== null) state.auditLog        = auditLog;
-    if (keyCooldown !== null) state.keyCooldown     = keyCooldown;
+    if (keyCooldown    !== null) state.keyCooldown     = keyCooldown;
+    if (analyticsLog   !== null) state.analyticsLog    = analyticsLog;  // v7.0
 
     const buyOpen = state.positions.filter(p => p.direction === "BUY").length;
     if (buyOpen > 0) log(`⚠️ ATENCIÓN: ${buyOpen} BUY abiertos (BUY_ENABLED=false — cerrarán por TIMEOUT/SL)`, "WARN");
@@ -298,6 +304,7 @@ async function saveState() {
       dbSet("rejectedHistory", state.rejectedHistory),
       dbSet("auditLog",        state.auditLog),
       dbSet("keyCooldown",     state.keyCooldown),
+      dbSet("analyticsLog",    state.analyticsLog),   // v7.0
     ]);
   } catch (err) {
     log(`saveState error: ${err.message}`, "ERR");
@@ -594,9 +601,49 @@ async function managePositions(markets) {
   }
 }
 
+// v7.0: actualizar resultado hipotético de señales pendientes en analyticsLog.
+// Cada ciclo, para las entradas PENDING, calcula si habría llegado a TP/SL/TIMEOUT.
+function updateAnalytics(priceMap) {
+  if (!state.analyticsLog) return;
+  const now = Date.now();
+  for (const entry of state.analyticsLog) {
+    if (entry.outcome !== "PENDING") continue;
+    const currentPrice = priceMap.get(entry.slug);
+    if (currentPrice === undefined) continue;
+
+    const eff = entry.direction === "SELL_PROXY" ? 1 - currentPrice : currentPrice;
+    const roi = (eff - entry.entryPrice) / entry.entryPrice;
+
+    // Actualizar mejor/peor ROI visto
+    if (entry.maxRoi === undefined || roi > entry.maxRoi) entry.maxRoi = roi;
+    if (entry.minRoi === undefined || roi < entry.minRoi) entry.minRoi = roi;
+
+    const cyclesHeld = state.cycle - entry.cycle;
+
+    if (roi >= CONFIG.TAKE_PROFIT_ROI) {
+      entry.exitPrice       = parseFloat(eff.toFixed(4));
+      entry.hypotheticalRoi = parseFloat(roi.toFixed(4));
+      entry.outcome         = "TP";
+      entry.cyclesHeld      = cyclesHeld;
+    } else if (roi <= CONFIG.STOP_LOSS_ROI) {
+      entry.exitPrice       = parseFloat(eff.toFixed(4));
+      entry.hypotheticalRoi = parseFloat(roi.toFixed(4));
+      entry.outcome         = "SL";
+      entry.cyclesHeld      = cyclesHeld;
+    } else if (cyclesHeld >= 24) {
+      // Simular TIMEOUT a las 24h
+      entry.exitPrice       = parseFloat(eff.toFixed(4));
+      entry.hypotheticalRoi = parseFloat(roi.toFixed(4));
+      entry.outcome         = "TIMEOUT";
+      entry.cyclesHeld      = cyclesHeld;
+    }
+  }
+}
+
 function auditRejected(rejected, allMarkets, validSlugs) {
   if (!state.rejectedHistory) state.rejectedHistory = {};
   if (!state.auditLog)        state.auditLog = [];
+  if (!state.analyticsLog)    state.analyticsLog = [];
 
   for (const m of allMarkets) {
     if (validSlugs.has(m.slug)) continue;
@@ -604,6 +651,48 @@ function auditRejected(rejected, allMarkets, validSlugs) {
     state.rejectedHistory[m.slug].push({ price: m.price, ts: Date.now() });
     if (state.rejectedHistory[m.slug].length > CONFIG.HISTORY_WINDOW + CONFIG.HISTORY_EXTRA) {
       state.rejectedHistory[m.slug].shift();
+    }
+
+    // v7.0: registrar señales rechazadas por vol/liq con contexto analítico.
+    // Permite calcular PF virtual posterior: "¿qué habría pasado si entraba?"
+    const rHist = state.rejectedHistory[m.slug];
+    if (rHist.length >= CONFIG.MIN_HIST_CYCLES) {
+      const prices  = rHist.map(h => h.price);
+      const rMean   = prices.reduce((s, p) => s + p, 0) / prices.length;
+      const rStd    = Math.sqrt(prices.reduce((s, p) => s + (p - rMean) ** 2, 0) / (prices.length - 1));
+      if (rStd > 0.005 && Math.abs(m.price - rMean) >= CONFIG.MIN_ABSOLUTE_DEVIATION) {
+        const rZ = (m.price - rMean) / rStd;
+        if (Math.abs(rZ) >= CONFIG.REVERSION_THRESHOLD) {
+          const cat       = marketCategory(m.question);
+          const zBucket   = Math.abs(rZ) < 2.0 ? "1.5-2.0"
+                          : Math.abs(rZ) < 2.5 ? "2.0-2.5"
+                          : Math.abs(rZ) < 3.0 ? "2.5-3.0" : "3.0+";
+          const rejReason = m.volume24h < CONFIG.MIN_VOLUME_24H ? "LOW_VOLUME"
+                          : m.liquidity < CONFIG.MIN_LIQ         ? "LOW_LIQUIDITY"
+                          : "OTHER";
+          state.analyticsLog.push({
+            cycle:     state.cycle,
+            slug:      m.slug,
+            question:  m.question.slice(0, 50),
+            category:  cat,
+            zScore:    parseFloat(rZ.toFixed(3)),
+            zBucket,
+            price:     m.price,
+            mean:      parseFloat(rMean.toFixed(4)),
+            std:       parseFloat(rStd.toFixed(4)),
+            volume24h: m.volume24h,
+            liquidity: m.liquidity,
+            rejReason,
+            // Resultado hipotético (se actualizará en ciclos siguientes via updateAnalytics)
+            entryPrice:  rZ < 0 ? m.price       : parseFloat((1 - m.price).toFixed(4)),
+            direction:   rZ < 0 ? "BUY"         : "SELL_PROXY",
+            exitPrice:   null,
+            hypotheticalRoi: null,
+            outcome:    "PENDING",
+          });
+          if (state.analyticsLog.length > 500) state.analyticsLog.shift();
+        }
+      }
     }
   }
 
@@ -760,6 +849,58 @@ function printReport(totalMarkets, validCount, rejected, candidateCount) {
       log(`  DIR ${d}: ${s.n} WR=${wr2}% PF=${pf2} pnl=$${s.pnl.toFixed(2)}`);
     }
   }
+  // v7.0: resumen analítico de señales rechazadas
+  if (state.analyticsLog && state.analyticsLog.length > 0) {
+    const resolved = state.analyticsLog.filter(e => e.outcome !== "PENDING");
+    if (resolved.length > 0) {
+      const tps = resolved.filter(e => e.outcome === "TP").length;
+      const sls = resolved.filter(e => e.outcome === "SL").length;
+      const tos = resolved.filter(e => e.outcome === "TIMEOUT").length;
+      const vWins = resolved.filter(e => e.hypotheticalRoi > 0);
+      const vLoss = resolved.filter(e => e.hypotheticalRoi <= 0);
+      const vGW = vWins.reduce((s,e) => s + e.hypotheticalRoi, 0);
+      const vGL = Math.abs(vLoss.reduce((s,e) => s + e.hypotheticalRoi, 0));
+      const vPF = vGL > 0 ? (vGW / vGL).toFixed(2) : "∞";
+      const vWR = ((tps / resolved.length) * 100).toFixed(0);
+      log(`ANALYTICS | señales rechazadas resueltas=${resolved.length} (pending=${state.analyticsLog.length - resolved.length}) TP=${tps} SL=${sls} TO=${tos} vWR=${vWR}% vPF=${vPF}`);
+
+      // Por razón de rechazo
+      const byRej = {};
+      for (const e of resolved) {
+        if (!byRej[e.rejReason]) byRej[e.rejReason] = { n:0, tps:0 };
+        byRej[e.rejReason].n++;
+        if (e.outcome === "TP") byRej[e.rejReason].tps++;
+      }
+      for (const [r, s] of Object.entries(byRej)) {
+        log(`  ANALYTICS ${r}: ${s.n} señales vWR=${((s.tps/s.n)*100).toFixed(0)}%`);
+      }
+
+      // Por categoría
+      const byCat = {};
+      for (const e of resolved) {
+        if (!byCat[e.category]) byCat[e.category] = { n:0, tps:0 };
+        byCat[e.category].n++;
+        if (e.outcome === "TP") byCat[e.category].tps++;
+      }
+      for (const [c, s] of Object.entries(byCat)) {
+        log(`  ANALYTICS cat=${c}: ${s.n} señales vWR=${((s.tps/s.n)*100).toFixed(0)}%`);
+      }
+
+      // Por z-bucket
+      const byZ = {};
+      for (const e of resolved) {
+        if (!byZ[e.zBucket]) byZ[e.zBucket] = { n:0, tps:0 };
+        byZ[e.zBucket].n++;
+        if (e.outcome === "TP") byZ[e.zBucket].tps++;
+      }
+      for (const [z, s] of Object.entries(byZ).sort(([a],[b]) => a.localeCompare(b))) {
+        log(`  ANALYTICS z=${z}: ${s.n} señales vWR=${((s.tps/s.n)*100).toFixed(0)}%`);
+      }
+    } else {
+      log(`ANALYTICS | señales rechazadas pendientes=${state.analyticsLog.length} (sin resolver aún)`);
+    }
+  }
+
   log(div);
 }
 
@@ -774,6 +915,10 @@ async function runCycle() {
     if (allMarkets.length === 0) { log("Sin mercados, reintentando...", "WARN"); return; }
 
     await managePositions(allMarkets);
+
+    // v7.0: actualizar resultados hipotéticos de señales rechazadas
+    const priceMapForAnalytics = new Map(allMarkets.map(m => [m.slug, m.price]));
+    updateAnalytics(priceMapForAnalytics);
 
     const signalOverrideSlugs = new Set();
     if (state.rejectedHistory) {
@@ -927,7 +1072,7 @@ async function scheduler() {
 
 // ─── ARRANQUE ─────────────────────────────────────────────────
 log("════════════════════════════════════════════════════════════");
-log("MICRODRIFT v6.9 — SELL_PROXY ONLY + RISK 2%");
+log("MICRODRIFT v7.0 — ANALYTICS LOG + PF VIRTUAL");
 log(`Supabase: ${SUPABASE_URL}`);
 log(`Capital: $${CONFIG.INITIAL_EQUITY} × 3 bots = $${CONFIG.INITIAL_EQUITY * 3} total`);
 log(`Ventana: ${CONFIG.HISTORY_WINDOW}h | MinCiclos: ${CONFIG.MIN_HIST_CYCLES} | Hold: ${CONFIG.MAX_HOLD_MS/3_600_000}h`);
@@ -955,7 +1100,7 @@ http.createServer((req, res) => {
   const activeCooldowns = Object.keys(state.keyCooldown).filter(k => isKeyCoolingDown(k)).length;
   const body = JSON.stringify({
     status:          "running",
-    version:         "v6.9-sellproxy-only",
+    version:         "v7.0-analytics-log",
     buy_enabled:     CONFIG.BUY_ENABLED,
     risk_per_trade:  CONFIG.RISK_PER_TRADE,
     cycle:           state.cycle,
