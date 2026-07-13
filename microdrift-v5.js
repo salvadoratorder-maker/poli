@@ -603,13 +603,26 @@ async function managePositions(markets) {
 
 // v7.0: actualizar resultado hipotético de señales pendientes en analyticsLog.
 // Cada ciclo, para las entradas PENDING, calcula si habría llegado a TP/SL/TIMEOUT.
+// v7.1: marca como EXPIRED entradas que llevan >48 ciclos sin encontrar precio
+//       (mercado cerrado en Polymarket o slug desaparecido).
 function updateAnalytics(priceMap) {
   if (!state.analyticsLog) return;
-  const now = Date.now();
   for (const entry of state.analyticsLog) {
     if (entry.outcome !== "PENDING") continue;
+
+    const cyclesHeld = state.cycle - entry.cycle;
     const currentPrice = priceMap.get(entry.slug);
-    if (currentPrice === undefined) continue;
+
+    // v7.1: si no hay precio y llevan >48 ciclos → mercado cerrado, marcar EXPIRED
+    if (currentPrice === undefined) {
+      if (cyclesHeld > 48) {
+        entry.outcome    = "EXPIRED";
+        entry.cyclesHeld = cyclesHeld;
+        entry.expiredAt  = state.cycle;
+        log(`ANALYTICS EXPIRED: ${entry.slug.slice(0, 35)} (${cyclesHeld} ciclos sin precio)`, "WARN");
+      }
+      continue;
+    }
 
     const eff = entry.direction === "SELL_PROXY" ? 1 - currentPrice : currentPrice;
     const roi = (eff - entry.entryPrice) / entry.entryPrice;
@@ -617,8 +630,6 @@ function updateAnalytics(priceMap) {
     // Actualizar mejor/peor ROI visto
     if (entry.maxRoi === undefined || roi > entry.maxRoi) entry.maxRoi = roi;
     if (entry.minRoi === undefined || roi < entry.minRoi) entry.minRoi = roi;
-
-    const cyclesHeld = state.cycle - entry.cycle;
 
     if (roi >= CONFIG.TAKE_PROFIT_ROI) {
       entry.exitPrice       = parseFloat(eff.toFixed(4));
@@ -853,16 +864,18 @@ function printReport(totalMarkets, validCount, rejected, candidateCount) {
   if (state.analyticsLog && state.analyticsLog.length > 0) {
     const resolved = state.analyticsLog.filter(e => e.outcome !== "PENDING");
     if (resolved.length > 0) {
-      const tps = resolved.filter(e => e.outcome === "TP").length;
-      const sls = resolved.filter(e => e.outcome === "SL").length;
-      const tos = resolved.filter(e => e.outcome === "TIMEOUT").length;
+      const tps     = resolved.filter(e => e.outcome === "TP").length;
+      const sls     = resolved.filter(e => e.outcome === "SL").length;
+      const tos     = resolved.filter(e => e.outcome === "TIMEOUT").length;
+      const expired = resolved.filter(e => e.outcome === "EXPIRED").length;
       const vWins = resolved.filter(e => e.hypotheticalRoi > 0);
       const vLoss = resolved.filter(e => e.hypotheticalRoi <= 0);
       const vGW = vWins.reduce((s,e) => s + e.hypotheticalRoi, 0);
       const vGL = Math.abs(vLoss.reduce((s,e) => s + e.hypotheticalRoi, 0));
       const vPF = vGL > 0 ? (vGW / vGL).toFixed(2) : "∞";
-      const vWR = ((tps / resolved.length) * 100).toFixed(0);
-      log(`ANALYTICS | señales rechazadas resueltas=${resolved.length} (pending=${state.analyticsLog.length - resolved.length}) TP=${tps} SL=${sls} TO=${tos} vWR=${vWR}% vPF=${vPF}`);
+      const actionable = resolved.filter(e => e.outcome !== "EXPIRED").length;
+      const vWR = actionable > 0 ? ((tps / actionable) * 100).toFixed(0) : "—";
+      log(`ANALYTICS | resueltas=${resolved.length} (pending=${state.analyticsLog.length - resolved.length}) TP=${tps} SL=${sls} TO=${tos} EXPIRED=${expired} vWR=${vWR}% vPF=${vPF}`);
 
       // Por razón de rechazo
       const byRej = {};
@@ -1072,7 +1085,7 @@ async function scheduler() {
 
 // ─── ARRANQUE ─────────────────────────────────────────────────
 log("════════════════════════════════════════════════════════════");
-log("MICRODRIFT v7.0 — ANALYTICS LOG + PF VIRTUAL");
+log("MICRODRIFT v7.1 — ANALYTICS EXPIRED + CLEANUP");
 log(`Supabase: ${SUPABASE_URL}`);
 log(`Capital: $${CONFIG.INITIAL_EQUITY} × 3 bots = $${CONFIG.INITIAL_EQUITY * 3} total`);
 log(`Ventana: ${CONFIG.HISTORY_WINDOW}h | MinCiclos: ${CONFIG.MIN_HIST_CYCLES} | Hold: ${CONFIG.MAX_HOLD_MS/3_600_000}h`);
@@ -1100,7 +1113,7 @@ http.createServer((req, res) => {
   const activeCooldowns = Object.keys(state.keyCooldown).filter(k => isKeyCoolingDown(k)).length;
   const body = JSON.stringify({
     status:          "running",
-    version:         "v7.0-analytics-log",
+    version:         "v7.1-analytics-expired",
     buy_enabled:     CONFIG.BUY_ENABLED,
     risk_per_trade:  CONFIG.RISK_PER_TRADE,
     cycle:           state.cycle,
